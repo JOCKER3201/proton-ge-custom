@@ -1,0 +1,594 @@
+From: Claude (Anthropic AI) <noreply@anthropic.com>
+Subject: [PATCH] vkd3d: Implement NVAPI FP16x2/FP32 atomics.
+
+Replaces the dummy fp16x2 atomic emitter (which emitted a 32-bit integer add
+and a constant image write) with real OpAtomicFAddEXT/FMinEXT/FMaxEXT on
+f16vec2, adds the fp32 variant, stops swallowing translation failures, and
+enables the Vulkan extensions the generated SPIR-V needs.
+---
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -118,6 +118,9 @@
+     VK_EXTENSION(EXT_EXTENDED_DYNAMIC_STATE_3, EXT_extended_dynamic_state3),
+     VK_EXTENSION(EXT_EXTERNAL_MEMORY_HOST, EXT_external_memory_host),
+     VK_EXTENSION(EXT_SHADER_IMAGE_ATOMIC_INT64, EXT_shader_image_atomic_int64),
++    VK_EXTENSION(EXT_SHADER_ATOMIC_FLOAT, EXT_shader_atomic_float),
++    VK_EXTENSION(EXT_SHADER_ATOMIC_FLOAT_2, EXT_shader_atomic_float2),
++    VK_EXTENSION(NV_SHADER_ATOMIC_FLOAT16_VECTOR, NV_shader_atomic_float16_vector),
+     VK_EXTENSION(EXT_MESH_SHADER, EXT_mesh_shader),
+     VK_EXTENSION(EXT_MUTABLE_DESCRIPTOR_TYPE, EXT_mutable_descriptor_type),
+     VK_EXTENSION(EXT_HDR_METADATA, EXT_hdr_metadata),
+@@ -2315,6 +2318,27 @@
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT;
+         vk_prepend_struct(&info->features2, &info->shader_image_atomic_int64_features);
+     }
++    if (vulkan_info->EXT_shader_atomic_float)
++    {
++        info->shader_atomic_float_features.sType =
++                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
++        vk_prepend_struct(&info->features2, &info->shader_atomic_float_features);
++    }
++
++    if (vulkan_info->EXT_shader_atomic_float2)
++    {
++        info->shader_atomic_float2_features.sType =
++                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT;
++        vk_prepend_struct(&info->features2, &info->shader_atomic_float2_features);
++    }
++
++    if (vulkan_info->NV_shader_atomic_float16_vector)
++    {
++        info->shader_atomic_float16_vector_features.sType =
++                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT16_VECTOR_FEATURES_NV;
++        vk_prepend_struct(&info->features2, &info->shader_atomic_float16_vector_features);
++    }
++
+ 
+     if (vulkan_info->AMD_device_coherent_memory)
+     {
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -175,6 +175,9 @@
+     bool EXT_extended_dynamic_state3;
+     bool EXT_external_memory_host;
+     bool EXT_shader_image_atomic_int64;
++    bool EXT_shader_atomic_float;
++    bool EXT_shader_atomic_float2;
++    bool NV_shader_atomic_float16_vector;
+     bool EXT_mesh_shader;
+     bool EXT_mutable_descriptor_type; /* EXT promotion of VALVE one. */
+     bool EXT_hdr_metadata;
+@@ -5375,6 +5378,9 @@
+     VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features;
+     VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_shader_derivatives_features_khr;
+     VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT shader_image_atomic_int64_features;
++    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT shader_atomic_float_features;
++    VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT shader_atomic_float2_features;
++    VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV shader_atomic_float16_vector_features;
+     VkPhysicalDeviceImageViewMinLodFeaturesEXT image_view_min_lod_features;
+     VkPhysicalDeviceCoherentMemoryFeaturesAMD device_coherent_memory_features_amd;
+     VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR ray_tracing_maintenance1_features;
+diff --git a/subprojects/dxil-spirv/dxil_converter.cpp b/subprojects/dxil-spirv/dxil_converter.cpp
+--- a/subprojects/dxil-spirv/dxil_converter.cpp
++++ b/subprojects/dxil-spirv/dxil_converter.cpp
+@@ -622,7 +622,8 @@ spv::Id Converter::Impl::create_bindless_heap_variable(const BindlessInfo &info)
+ 				if (info.component != DXIL::ComponentType::U32 &&
+ 				    info.component != DXIL::ComponentType::I32 &&
+ 				    info.component != DXIL::ComponentType::F32 &&
+-				    info.component != DXIL::ComponentType::U64)
++				    info.component != DXIL::ComponentType::U64 &&
++				    info.component != DXIL::ComponentType::F16)
+ 				{
+ 					LOGE("Invalid component type for image.\n");
+ 					return 0;
+@@ -1056,18 +1057,33 @@ bool Converter::Impl::analyze_aliased_access(const AccessTracking &tracking,
+ 	bool raw_access_16bit = false;
+ 	bool raw_access_64bit = false;
+ 
++	aliased_access.needs_fp16_vector_image_alias = tracking.needs_fp16_vector_image_alias;
++
+ 	for (int type_ = 0; type_ < int(RawType::Count); type_++)
+ 	{
+ 		for (int width_ = 0; width_ < int(RawWidth::Count); width_++)
+ 		{
+ 			auto width = RawWidth(width_);
+-			if (width == RawWidth::B16 && !execution_mode_meta.native_16bit_operations)
++			/* A forced 16-bit alias only makes sense for buffer-backed
++			 * descriptors; typed images carry their own element type. */
++			bool buffer_backed = descriptor_type == VulkanDescriptorType::SSBO ||
++			                     descriptor_type == VulkanDescriptorType::UBO ||
++			                     descriptor_type == VulkanDescriptorType::BufferDeviceAddress;
++			bool forced_16bit = tracking.force_raw_16bit_alias && buffer_backed;
++			if (width == RawWidth::B16 && !execution_mode_meta.native_16bit_operations && !forced_16bit)
+ 				continue;
+ 
+ 			for (int vecsize_ = 0; vecsize_ < int(RawVecSize::Count); vecsize_++)
+ 			{
+ 				auto vecsize = RawVecSize(vecsize_);
+ 				auto type = RawType(type_);
++
++				/* The fp16x2 vendor intrinsic requests this declaration up front,
++				 * before the descriptor type is known. On a typed image it is
++				 * meaningless and would trip the raw-16-bit guard below. */
++				if (tracking.force_raw_16bit_alias && !buffer_backed &&
++				    type == RawType::Float && width == RawWidth::B16 && vecsize == RawVecSize::V2)
++					continue;
+ 				// Non-native 16-bit SSBOs are declared as 32-bit, so avoid false aliases.
+ 				bool has_decl = tracking.raw_access_buffer_declarations[type_][width_][vecsize_];
+ 				if (!has_decl && RawWidth(width) == RawWidth::B32 && !execution_mode_meta.native_16bit_operations)
+@@ -2167,6 +2183,17 @@ bool Converter::Impl::emit_uavs(const llvm::MDNode *uavs, const llvm::MDNode *re
+ 				ref.var_id = create_bindless_heap_variable(bindless_info);
+ 			}
+ 
++			if (aliased_access.needs_fp16_vector_image_alias &&
++			    vulkan_binding.buffer_binding.descriptor_type != VulkanDescriptorType::SSBO &&
++			    vulkan_binding.buffer_binding.descriptor_type != VulkanDescriptorType::BufferDeviceAddress)
++			{
++				auto fp16_info = bindless_info;
++				fp16_info.component = DXIL::ComponentType::F16;
++				fp16_info.raw_vecsize = RawVecSize::V2;
++				fp16_info.format = spv::ImageFormatRg16f;
++				ref.fp16_vector_var_id = create_bindless_heap_variable(fp16_info);
++			}
++
+ 			ref.aliased = aliased_access.requires_alias_decoration;
+ 			ref.push_constant_member = vulkan_binding.buffer_binding.root_constant_index + root_descriptor_count;
+ 			ref.base_offset = heap_offset;
+@@ -2263,8 +2290,34 @@ bool Converter::Impl::emit_uavs(const llvm::MDNode *uavs, const llvm::MDNode *re
+ 					builder.addDecoration(var_id, spv::DecorationRelaxedPrecision);
+ 			}
+ 
++			/* NVAPI fp16x2 atomics address the image through a half-typed view
++			 * of the very same descriptor. */
++			spv::Id fp16_vector_var_id = 0;
++			if (aliased_access.needs_fp16_vector_image_alias && storage == spv::StorageClassUniformConstant)
++			{
++				/* The fp16x2 image atomics are defined against rg16f/rgba16f
++				 * format qualifiers by NV_shader_atomic_fp16_vector; the SPIR-V
++				 * extension itself only relaxes the atomic result type. */
++				spv::Id alias_type_id = builder.makeImageType(
++				    builder.makeFloatType(16), image_dimension_from_resource_kind(resource_kind), false,
++				    image_dimension_is_arrayed(resource_kind),
++				    image_dimension_is_multisampled(resource_kind), 2, spv::ImageFormatRg16f);
++
++				if (range_size != 1)
++				{
++					if (range_size == ~0u)
++						alias_type_id = builder.makeRuntimeArray(alias_type_id);
++					else
++						alias_type_id = builder.makeArrayType(alias_type_id, builder.makeUintConstant(range_size), 0);
++				}
++
++				fp16_vector_var_id = create_variable(storage, alias_type_id,
++				                                     name.empty() ? nullptr : (name + "Fp16").c_str());
++			}
++
+ 			auto &ref = uav_index_to_reference[index];
+ 			ref.var_id = var_id;
++			ref.fp16_vector_var_id = fp16_vector_var_id;
+ 			ref.var_alias_group = std::move(var_alias_group);
+ 			ref.aliased = aliased_access.requires_alias_decoration;
+ 			ref.stride = stride;
+@@ -2293,6 +2346,8 @@ bool Converter::Impl::emit_uavs(const llvm::MDNode *uavs, const llvm::MDNode *re
+ 
+ 			if (var_id)
+ 				decorate_variable(var_id);
++			if (fp16_vector_var_id)
++				decorate_variable(fp16_vector_var_id);
+ 			for (auto &var : ref.var_alias_group)
+ 				decorate_variable(var.var_id);
+ 
+diff --git a/subprojects/dxil-spirv/opcodes/converter_impl.hpp b/subprojects/dxil-spirv/opcodes/converter_impl.hpp
+--- a/subprojects/dxil-spirv/opcodes/converter_impl.hpp
++++ b/subprojects/dxil-spirv/opcodes/converter_impl.hpp
+@@ -188,6 +188,12 @@ struct AccessTracking
+ 	bool has_atomic_64bit = false;
+ 	bool has_counter = false;
+ 	bool dynamically_indexed_cbv = false;
++	/* Set when a vendor intrinsic needs a 16-bit raw alias even though the
++	 * shader itself never declares native 16-bit operations. */
++	bool force_raw_16bit_alias = false;
++	/* Set when a vendor intrinsic performs fp16x2 atomics on a typed UAV.
++	 * Such an image must be redeclared with a 16-bit float sampled type. */
++	bool needs_fp16_vector_image_alias = false;
+ 	bool raw_access_buffer_declarations[unsigned(RawType::Count)][unsigned(RawWidth::Count)][unsigned(RawVecSize::Count)] = {};
+ };
+ 
+@@ -444,6 +450,7 @@ struct Converter::Impl
+ 		bool coherent = false;
+ 		bool rov = false;
+ 		DXIL::ResourceKind resource_kind = DXIL::ResourceKind::Invalid;
++		spv::Id fp16_vector_var_id = 0;
+ 		int local_root_signature_entry = -1;
+ 		ReferenceVkMemoryModel vkmm;
+ 	};
+@@ -519,6 +526,7 @@ struct Converter::Impl
+ 		unsigned stride;
+ 
+ 		spv::Id var_id;
++		spv::Id fp16_vector_var_id;
+ 		Vector<RawDeclarationVariable> var_alias_group;
+ 		bool aliased;
+ 		bool non_uniform;
+@@ -980,6 +988,7 @@ struct Converter::Impl
+ 		bool override_primary_component_types = false;
+ 		DXIL::ComponentType primary_component_type = DXIL::ComponentType::Invalid;
+ 		RawVecSize primary_raw_vecsize = RawVecSize::V1;
++		bool needs_fp16_vector_image_alias = false;
+ 	};
+ 	bool analyze_aliased_access(const AccessTracking &tracking,
+ 	                            VulkanDescriptorType descriptor_type,
+diff --git a/subprojects/dxil-spirv/opcodes/dxil/dxil_nvapi.cpp b/subprojects/dxil-spirv/opcodes/dxil/dxil_nvapi.cpp
+--- a/subprojects/dxil-spirv/opcodes/dxil/dxil_nvapi.cpp
++++ b/subprojects/dxil-spirv/opcodes/dxil/dxil_nvapi.cpp
+@@ -6,6 +6,7 @@
+ #include "dxil_nvapi.hpp"
+ #include "dxil_common.hpp"
+ #include "dxil_ray_tracing.hpp"
++#include "dxil_sampling.hpp"
+ #include "opcodes/converter_impl.hpp"
+ #include "logging.hpp"
+ 
+@@ -192,55 +193,225 @@ static bool emit_nvapi_extn_op_shuffle(Converter::Impl &impl)
+ 	return true;
+ }
+ 
++/* Sub-opcodes carried in src2u.x by the NVAPI HLSL header. The header documents
++ * them as immediate constants. */
++enum
++{
++	NVAPI_ATOM_ADD = 3,
++	NVAPI_ATOM_MAX = 6,
++	NVAPI_ATOM_MIN = 7,
++};
++
++static bool nvapi_atomic_float_opcode(Converter::Impl &impl, uint32_t sub_op, spv::Op *out)
++{
++	switch (sub_op)
++	{
++	case NVAPI_ATOM_ADD: *out = spv::OpAtomicFAddEXT; return true;
++	case NVAPI_ATOM_MAX: *out = spv::OpAtomicFMaxEXT; return true;
++	case NVAPI_ATOM_MIN: *out = spv::OpAtomicFMinEXT; return true;
++	default:
++		LOGE("NVAPI float atomic sub-opcode %u is not supported.\n", sub_op);
++		(void)impl;
++		return false;
++	}
++}
++
++/* Turns a RWByteAddressBuffer byte address into an element index for an alias
++ * whose elements are element_size bytes wide. */
++static spv::Id nvapi_byte_address_to_index(Converter::Impl &impl, spv::Id byte_addr, uint32_t element_size_log2)
++{
++	auto &builder = impl.builder();
++	auto *shift = impl.allocate(spv::OpShiftRightLogical, builder.makeUintType(32));
++	shift->add_id(byte_addr);
++	shift->add_id(builder.makeUintConstant(element_size_log2));
++	impl.add(shift);
++	return shift->id;
++}
++
++/* __NvAtomicOpFP16x2: atomically applies op to a packed pair of fp16 values.
++ * src0u = address, src1u.x = two fp16 packed in a uint, src2u.x = sub-opcode.
++ * Returns the pre-op value, packed the same way. */
+ static bool emit_nvapi_extn_op_fp16x2_atomic(Converter::Impl &impl)
+ {
+ 	if (!impl.nvapi.marked_uav)
+ 		return false;
+ 
+-	// Dummy throwaway implementation to demonstrate UAV reference plumbing.
+-	spv::Id addr = get_argument(impl, NVAPI_ARGUMENT_SRC0U + 0);
+-	spv::Id val = get_argument(impl, NVAPI_ARGUMENT_SRC1U + 0);
+-	spv::Id type = get_argument(impl, NVAPI_ARGUMENT_SRC2U + 0);
+-	(void)type;
+-
+ 	auto &builder = impl.builder();
+ 
++	auto *sub_op_value = llvm::dyn_cast<llvm::ConstantInt>(impl.nvapi.fake_doorbell_inputs[NVAPI_ARGUMENT_SRC2U + 0]);
++	if (!sub_op_value)
++	{
++		LOGE("NVAPI FP16x2 atomic sub-opcode is not a constant, cannot translate.\n");
++		return false;
++	}
++
++	spv::Op atomic_opcode;
++	if (!nvapi_atomic_float_opcode(impl, uint32_t(sub_op_value->getUniqueInteger().getZExtValue()), &atomic_opcode))
++		return false;
++
+ 	spv::Id id = impl.get_id_for_value(impl.nvapi.marked_uav);
+ 	const auto &meta = impl.handle_to_resource_meta[id];
+ 
+-	if (meta.storage == spv::StorageClassStorageBuffer)
++	builder.addCapability(spv::CapabilityFloat16);
++	builder.addCapability(spv::CapabilityAtomicFloat16VectorNV);
++	builder.addExtension("SPV_NV_shader_atomic_fp16_vector");
++
++	spv::Id f16vec2_type = builder.makeVectorType(builder.makeFloatType(16), 2);
++	dxil_spv::Operation *chain;
++	bool is_buffer = meta.storage == spv::StorageClassStorageBuffer;
++
++	if (is_buffer)
+ 	{
+-		spv::Id ssbo_id = get_buffer_alias_handle(impl, meta, id, RawType::Integer, RawWidth::B32, RawVecSize::V1);
++		/* Each f16vec2 element is 4 bytes wide. */
++		spv::Id index = nvapi_byte_address_to_index(impl, get_argument(impl, NVAPI_ARGUMENT_SRC0U + 0), 2);
++		spv::Id ssbo_id = get_buffer_alias_handle(impl, meta, id, RawType::Float, RawWidth::B16, RawVecSize::V2);
+ 
+-		auto *chain = impl.allocate(spv::OpAccessChain,
+-		                            builder.makePointer(spv::StorageClassStorageBuffer, builder.makeUintType(32)));
+-		chain->add_id(ssbo_id);
+-		chain->add_id(builder.makeUintConstant(0));
+-		chain->add_id(addr);
++		chain = impl.allocate(spv::OpAccessChain, builder.makePointer(spv::StorageClassStorageBuffer, f16vec2_type));
++		chain->add_ids({ ssbo_id, builder.makeUintConstant(0), index });
+ 		impl.add(chain);
++	}
++	else
++	{
++		/* Typed UAV: R16G16_FLOAT storage image, addressed by texel coordinate. */
++		uint32_t num_coords_full = 0, num_coords = 0;
++		if (!get_image_dimensions(impl, id, &num_coords_full, &num_coords))
++			return false;
++		if (num_coords_full > 3)
++		{
++			LOGE("NVAPI FP16x2 atomic on %u-dimensional UAV is not supported.\n", num_coords_full);
++			return false;
++		}
++
++		spv::Id coords[3] = {};
++		for (uint32_t i = 0; i < num_coords_full; i++)
++			coords[i] = get_argument(impl, NVAPI_ARGUMENT_SRC0U + i);
++		spv::Id coord = impl.build_vector(builder.makeUintType(32), coords, num_coords_full);
+ 
+-		auto *atomic = impl.allocate(spv::OpAtomicIAdd, builder.makeUintType(32));
+-		atomic->add_id(chain->id);
+-		atomic->add_id(builder.makeUintConstant(spv::ScopeDevice));
+-		atomic->add_id(builder.makeUintConstant(0));
+-		atomic->add_id(val);
+-		impl.add(atomic);
++		/* OpImageTexelPointer needs the image *variable*, and its sampled type
++		 * must be fp16, hence the dedicated alias declared for this UAV. */
++		if (!meta.fp16_vector_var_id)
++		{
++			LOGE("NVAPI FP16x2 atomic on a typed UAV without an fp16 vector alias.\n");
++			return false;
++		}
+ 
+-		impl.nvapi.fake_doorbell_outputs[NVAPI_ARGUMENT_DST0U + 0] = atomic->id;
++		chain = impl.allocate(spv::OpImageTexelPointer, builder.makePointer(spv::StorageClassImage, f16vec2_type));
++		chain->add_ids({ meta.fp16_vector_var_id, coord, builder.makeUintConstant(0) });
++		impl.add(chain);
+ 	}
+-	else if (meta.storage == spv::StorageClassUniformConstant)
++
++	auto *value = impl.allocate(spv::OpBitcast, f16vec2_type);
++	value->add_id(get_argument(impl, NVAPI_ARGUMENT_SRC1U + 0));
++	impl.add(value);
++
++	auto *atomic = impl.allocate(atomic_opcode, f16vec2_type);
++	atomic->add_id(chain->id);
++	atomic->add_id(builder.getAtomicDeviceScopeId());
++	atomic->add_id(builder.makeUintConstant(0));
++	atomic->add_id(value->id);
++	impl.add(atomic);
++
++	auto *result = impl.allocate(spv::OpBitcast, builder.makeUintType(32));
++	result->add_id(atomic->id);
++	impl.add(result);
++
++	impl.nvapi.fake_doorbell_outputs[NVAPI_ARGUMENT_DST0U + 0] = result->id;
++	impl.nvapi.marked_uav = nullptr;
++	/* Diagnostic: confirms the intrinsic was translated rather than silently
++	 * dropped. Debug level, so it stays out of the way unless asked for. */
++	LOGI("NVAPI fp16x2 atomic translated (%s)\n", is_buffer ? "buffer" : "image");
++	return true;
++}
++
++/* __NvAtomicAddFP32 and friends. Same shape as FP16x2, but a scalar fp32. */
++static bool emit_nvapi_extn_op_fp32_atomic(Converter::Impl &impl)
++{
++	if (!impl.nvapi.marked_uav)
++		return false;
++
++	auto &builder = impl.builder();
++
++	auto *sub_op_value = llvm::dyn_cast<llvm::ConstantInt>(impl.nvapi.fake_doorbell_inputs[NVAPI_ARGUMENT_SRC2U + 0]);
++	if (!sub_op_value)
+ 	{
+-		auto *ptr = impl.allocate(spv::OpImageWrite);
+-		ptr->add_id(id);
+-		ptr->add_id(addr);
+-		ptr->add_id(impl.build_splat_constant_vector(builder.makeFloatType(32), builder.makeFloatConstant(2.0f), 4));
+-		impl.add(ptr);
+-
+-		builder.addCapability(spv::CapabilityStorageImageWriteWithoutFormat);
+-		impl.nvapi.fake_doorbell_outputs[NVAPI_ARGUMENT_DST0U + 0] = builder.makeUintConstant(42);
++		LOGE("NVAPI FP32 atomic sub-opcode is not a constant, cannot translate.\n");
++		return false;
+ 	}
+ 
++	uint32_t sub_op = uint32_t(sub_op_value->getUniqueInteger().getZExtValue());
++	spv::Op atomic_opcode;
++	if (!nvapi_atomic_float_opcode(impl, sub_op, &atomic_opcode))
++		return false;
++
++	spv::Id id = impl.get_id_for_value(impl.nvapi.marked_uav);
++	const auto &meta = impl.handle_to_resource_meta[id];
++
++	bool is_buffer = meta.storage == spv::StorageClassStorageBuffer;
++
++	if (sub_op == NVAPI_ATOM_ADD)
++	{
++		builder.addExtension("SPV_EXT_shader_atomic_float_add");
++		builder.addCapability(spv::CapabilityAtomicFloat32AddEXT);
++	}
++	else
++	{
++		builder.addExtension("SPV_EXT_shader_atomic_float_min_max");
++		builder.addCapability(spv::CapabilityAtomicFloat32MinMaxEXT);
++	}
++
++	spv::Id float_type = builder.makeFloatType(32);
++	dxil_spv::Operation *chain;
++
++	if (is_buffer)
++	{
++		/* Each fp32 element is 4 bytes wide. */
++		spv::Id index = nvapi_byte_address_to_index(impl, get_argument(impl, NVAPI_ARGUMENT_SRC0U + 0), 2);
++		spv::Id ssbo_id = get_buffer_alias_handle(impl, meta, id, RawType::Float, RawWidth::B32, RawVecSize::V1);
++
++		chain = impl.allocate(spv::OpAccessChain, builder.makePointer(spv::StorageClassStorageBuffer, float_type));
++		chain->add_ids({ ssbo_id, builder.makeUintConstant(0), index });
++	}
++	else
++	{
++		/* Typed UAV. The image already has a 32-bit float sampled type, so the
++		 * texel pointer needs no aliased redeclaration. */
++		uint32_t num_coords_full = 0, num_coords = 0;
++		if (!get_image_dimensions(impl, id, &num_coords_full, &num_coords))
++			return false;
++		if (num_coords_full > 3)
++		{
++			LOGE("NVAPI FP32 atomic on %u-dimensional UAV is not supported.\n", num_coords_full);
++			return false;
++		}
++
++		spv::Id coords[3] = {};
++		for (uint32_t i = 0; i < num_coords_full; i++)
++			coords[i] = get_argument(impl, NVAPI_ARGUMENT_SRC0U + i);
++		spv::Id coord = impl.build_vector(builder.makeUintType(32), coords, num_coords_full);
++
++		chain = impl.allocate(spv::OpImageTexelPointer, builder.makePointer(spv::StorageClassImage, float_type));
++		chain->add_ids({ meta.var_id, coord, builder.makeUintConstant(0) });
++	}
++	impl.add(chain);
++
++	auto *value = impl.allocate(spv::OpBitcast, float_type);
++	value->add_id(get_argument(impl, NVAPI_ARGUMENT_SRC1U + 0));
++	impl.add(value);
++
++	auto *atomic = impl.allocate(atomic_opcode, float_type);
++	atomic->add_id(chain->id);
++	atomic->add_id(builder.getAtomicDeviceScopeId());
++	atomic->add_id(builder.makeUintConstant(0));
++	atomic->add_id(value->id);
++	impl.add(atomic);
++
++	auto *result = impl.allocate(spv::OpBitcast, builder.makeUintType(32));
++	result->add_id(atomic->id);
++	impl.add(result);
++
++	impl.nvapi.fake_doorbell_outputs[NVAPI_ARGUMENT_DST0U + 0] = result->id;
+ 	impl.nvapi.marked_uav = nullptr;
++	LOGI("NVAPI fp32 atomic translated (%s)\n", is_buffer ? "buffer" : "image");
+ 	return true;
+ }
+ 
+@@ -808,9 +979,8 @@ bool NVAPIState::can_commit_opcode()
+ 			       fake_doorbell_inputs[NVAPI_ARGUMENT_SRC0U + 2] != nullptr;
+ 
+ 		case NV_EXTN_OP_FP16_ATOMIC:
+-			LOGE("NVAPI opcode %u not fully implemented.\n", opcode);
+-			return false && // emit_nvapi_extn_op_fp16x2_atomic is currently just a dummy implementation
+-			       marked_uav &&
++		case NV_EXTN_OP_FP32_ATOMIC:
++			return marked_uav &&
+ 			       fake_doorbell_inputs[NVAPI_ARGUMENT_SRC0U + 0] != nullptr &&
+ 			       fake_doorbell_inputs[NVAPI_ARGUMENT_SRC1U + 0] != nullptr &&
+ 			       fake_doorbell_inputs[NVAPI_ARGUMENT_SRC2U + 0] != nullptr;
+@@ -892,6 +1062,28 @@ bool NVAPIState::can_commit_opcode()
+ 		return false;
+ }
+ 
++/* Registers a raw-buffer alias declaration for the UAV the pending vendor
++ * intrinsic operates on, so analyze_aliased_access() creates a variable with a
++ * matching element type. */
++static void nvapi_request_raw_alias(Converter::Impl &impl, RawWidth width, RawVecSize vecsize)
++{
++	if (!impl.nvapi.marked_uav)
++		return;
++
++	auto itr = impl.llvm_value_to_uav_resource_index_map.find(impl.nvapi.marked_uav);
++	if (itr == impl.llvm_value_to_uav_resource_index_map.end())
++		return;
++
++	auto &tracking = impl.uav_access_tracking[itr->second];
++	tracking.raw_access_buffer_declarations[int(RawType::Float)][int(width)][int(vecsize)] = true;
++	if (width == RawWidth::B16)
++	{
++		tracking.force_raw_16bit_alias = true;
++		if (vecsize == RawVecSize::V2)
++			tracking.needs_fp16_vector_image_alias = true;
++	}
++}
++
+ bool NVAPIState::commit_opcode(Converter::Impl &impl, bool analysis)
+ {
+ 	if (!fake_doorbell_inputs[NVAPI_ARGUMENT_OPCODE])
+@@ -911,7 +1103,21 @@ bool NVAPIState::commit_opcode(Converter::Impl &impl, bool analysis)
+ 
+ 		case NV_EXTN_OP_FP16_ATOMIC:
+ 			impl.nvapi.num_expected_clock_outputs = 0;
+-			if (!analysis && !emit_nvapi_extn_op_fp16x2_atomic(impl))
++			/* The raw alias we need is only declared if the analysis pass asks
++			 * for it. Nothing else in the shader performs a f16vec2 raw access,
++			 * so request it here or the emit below has no correctly typed
++			 * pointer to build an access chain from. */
++			if (analysis)
++				nvapi_request_raw_alias(impl, RawWidth::B16, RawVecSize::V2);
++			else if (!emit_nvapi_extn_op_fp16x2_atomic(impl))
++				return false;
++			break;
++
++		case NV_EXTN_OP_FP32_ATOMIC:
++			impl.nvapi.num_expected_clock_outputs = 0;
++			if (analysis)
++				nvapi_request_raw_alias(impl, RawWidth::B32, RawVecSize::V1);
++			else if (!emit_nvapi_extn_op_fp32_atomic(impl))
+ 				return false;
+ 			break;
+ 
+@@ -1331,8 +1537,11 @@ bool NVAPIState::write_arguments_from_store(Converter::Impl &impl, const llvm::C
+ 			fake_doorbell_inputs[offset + i] = instruction->getOperand(4 + i);
+ 	}
+ 
++	/* Propagate translation failures instead of silently dropping the
++	 * operation. A dropped atomic leaves the shader computing the wrong
++	 * thing, which is far harder to diagnose than a failed compile. */
+ 	if (can_commit_opcode())
+-		commit_opcode(impl, analysis);
++		return commit_opcode(impl, analysis);
+ 
+ 	return true;
+ }
+diff --git a/subprojects/dxil-spirv/opcodes/dxil/dxil_resources.cpp b/subprojects/dxil-spirv/opcodes/dxil/dxil_resources.cpp
+--- a/subprojects/dxil-spirv/opcodes/dxil/dxil_resources.cpp
++++ b/subprojects/dxil-spirv/opcodes/dxil/dxil_resources.cpp
+@@ -1755,6 +1755,27 @@ static bool emit_create_handle(Converter::Impl &impl, const llvm::CallInst *inst
+ 			// Image atomics requires the pointer to image and not OpTypeImage directly.
+ 			meta.var_id = resource_ptr_id;
+ 
++			meta.fp16_vector_var_id = 0;
++			if (reference.fp16_vector_var_id)
++			{
++				spv::Id fp16_ptr_id = 0;
++				spv::Id fp16_offset_id = 0;
++				Converter::Impl::ResourceMetaInstrumentation fp16_instrumentation = {};
++
++				/* Only the pointer is wanted here. Asking for the loaded value
++				 * would reuse the id already allocated for this instruction. */
++				if (!build_load_resource_handle(impl, reference.fp16_vector_var_id, reference, descriptor_type,
++				                                instruction, instruction_offset, non_uniform, is_non_uniform,
++				                                &fp16_ptr_id, nullptr, &fp16_offset_id,
++				                                &fp16_instrumentation))
++				{
++					LOGE("Failed to load fp16 vector alias for UAV resource handle.\n");
++					return false;
++				}
++
++				meta.fp16_vector_var_id = fp16_ptr_id;
++			}
++
+ 			// The base array variable does not know what the stride is, promote that state here.
+ 			if (reference.bindless)
+ 				meta.stride = reference.stride;

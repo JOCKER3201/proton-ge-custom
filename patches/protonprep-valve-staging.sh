@@ -31,6 +31,8 @@ apply_all_in_dir() {
     pushd dxvk-nvapi
     git reset --hard HEAD
     git clean -xdf
+    echo "DXVK-NVAPI: enable D3D12 NV shader extensions by default"
+    apply_all_in_dir "../patches/dxvk-nvapi/"
     popd
 
     pushd protonfixes
@@ -302,6 +304,12 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/ntdll-remove-redundant-packed-split-lock.patch"
 
     # https://gitlab.winehq.org/wine/wine/-/commit/a31ec8da9572672e04ae46792a398da942649875
+    echo "WINE: -HOTFIX- Stack covering client above carrier without requiring presentation ownership"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-stack-covering-client-without-owner.patch"
+
+    echo "WINE: -HOTFIX- Drop duplicate PE-side Wayland event reader thread (skipped-hunk fixup)"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-drop-duplicate-event-reader-thread.patch"
+
     echo "WINE: -HOTFIX- Prefer native non-Microsoft DLLs using version resources"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-prefer-native-version-resource-heuristics.patch"
 

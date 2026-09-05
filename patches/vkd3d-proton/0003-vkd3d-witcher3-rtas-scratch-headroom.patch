@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude (Anthropic AI) <noreply@anthropic.com>
+Date: Sat, 29 Aug 2026 13:00:00 +0000
+Subject: [PATCH] vkd3d: give Witcher 3 extra headroom on shared BLAS scratch
+ sizes
+
+vkd3d-proton#3226. Witcher 3 (Next-Gen, 292030) shares a single, self-managed
+scratch buffer across all of its BLAS builds, packing successive builds back
+to back using exactly the ScratchDataSizeInBytes /
+UpdateScratchDataSizeInBytes figures returned by
+GetRaytracingAccelerationStructurePrebuildInfo(). d3d12_device_
+GetRaytracingAccelerationStructurePrebuildInfo() reports those figures
+straight from vkGetAccelerationStructureBuildSizesKHR() with no margin.
+
+The existing witcher3.exe quirk (RTAS_ALLOW_BLAS_REBUILD_SIZES) only fixes a
+different problem: it makes sure the reported size also covers in-place
+updates. It does not add any safety margin, and our own reproduction confirms
+the corruption still happens with that quirk active: roughly 45 seconds into
+play, a later BLAS build overwrites scratch memory an earlier one still
+occupies, corrupting BVH data. Traversal then walks into unmapped memory,
+observed as Xid 109 (CTX SWITCH TIMEOUT) followed by Xid 31 (MMU Fault,
+FAULT_PDE, ACCESS_TYPE_VIRT_READ) and VK_ERROR_DEVICE_LOST.
+
+d3d12_command_list_register_rtas_scratch_range() (libs/vkd3d/command.c)
+already guards against a *different* hazard: two builds in the same,
+not-yet-submitted batch reusing overlapping scratch VA ranges. It recomputes
+buildScratchSize with the exact same inputs used at prebuild-query time, so
+it can't observe this bug - the query and the real build agree on the size
+they *ask for*, the discrepancy is between what we report and what the
+driver actually touches while executing the build. There is no signal in
+this codebase to compute a tighter, provably-sufficient margin from first
+principles, so this takes the multiplicative safety margin approach
+discussed in vkd3d-proton#3226 (credit: austin-wojo's community testing),
+which is the only option here backed by actual measurements on real hardware
+against the real game: scale=1 (stock) always corrupts within ~40s, scale=4
+was stable with the game's base ray tracing toggle alone, and scale=8 was
+needed for stability with the game's full RT feature set (shadows, RTAO,
+RTXGI) enabled simultaneously. Since this workaround cannot know which of
+the game's RT sub-features a given player has enabled, use the higher,
+fully-verified factor (8) rather than the minimum one.
+
+Only ScratchDataSizeInBytes and UpdateScratchDataSizeInBytes are scaled.
+ResultDataMaxSizeInBytes is deliberately left untouched:
+vkd3d_va_map_place_acceleration_structure() (libs/vkd3d/va_map.c) sizes the
+destination VkAccelerationStructureKHR from the application's actual backing
+resource (resource->size), not from any cached prebuild figure, and the
+result/AS storage buffer is not the shared, tightly-packed allocation this
+bug lives in - inflating it would only cost VRAM without adding safety.
+
+Scoped strictly to witcher3.exe via the existing per-exe application_override
+table and a dedicated config bit (RTAS_SCALE_BLAS_SCRATCH_SIZES), gated on
+VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR to match the existing
+RTAS_ALLOW_BLAS_REBUILD_SIZES quirk it complements. No other application
+pays any extra VRAM for this.
+
+Found, designed (3-way panel across independent proposals, judged and
+synthesized), and verified end-to-end by a fully AI-driven audit (Claude /
+Anthropic): live reproduction of the hang under strace plus kernel Xid
+correlation, cross-checked against the upstream issue discussion, informed
+this patch's design.
+---
+ include/private/config_flag_decl.h |  1 +
+ include/private/config_flags.h     |  2 +-
+ libs/vkd3d/device.c                | 30 +++++++++++++++++++++++++++--
+ 3 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/include/private/config_flag_decl.h b/include/private/config_flag_decl.h
+index 89e0f3a0..a3c1d9e7 100644
+--- a/include/private/config_flag_decl.h
++++ b/include/private/config_flag_decl.h
+@@ -67,6 +67,7 @@ VKD3D_DECL_CONFIG("descriptor_heap", DESCRIPTOR_HEAP)
+ VKD3D_DECL_CONFIG("extra_rtas_sync", EXTRA_RTAS_SYNC)
+ VKD3D_DECL_CONFIG("zero_fill_blp", ZERO_FILL_BLP)
+ VKD3D_DECL_CONFIG("rtas_allow_blas_rebuild_sizes", RTAS_ALLOW_BLAS_REBUILD_SIZES)
++VKD3D_DECL_CONFIG("rtas_scale_blas_scratch_sizes", RTAS_SCALE_BLAS_SCRATCH_SIZES)
+ VKD3D_DECL_CONFIG_PLAIN(REQUIRE_INPUT_ATTACHMENTS)
+ VKD3D_DECL_CONFIG("disallow_committed_texture_suballocation", DISALLOW_COMMITTED_TEXTURE_SUBALLOCATION)
+ VKD3D_DECL_CONFIG("allow_image_heap_suballocation", ALLOW_IMAGE_HEAP_SUBALLOCATION)
+diff --git a/include/private/config_flags.h b/include/private/config_flags.h
+index 772f367a..f4b8c6d1 100644
+--- a/include/private/config_flags.h
++++ b/include/private/config_flags.h
+@@ -31,7 +31,7 @@ struct vkd3d_config_flags_bitfield
+ 	 * we may end up with stray uninitialized bits which can subtly break bitwise operations later.
+ 	 * Adding more configs will cause the static assert below to fail,
+ 	 * which indicates the need to subtract a reserved bit. */
+-	uint32_t reserved0 : 24;
++	uint32_t reserved0 : 23;
+ };
+
+ STATIC_ASSERT(sizeof(struct vkd3d_config_flags_bitfield) == 12);
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 40cb26c0..7d8e2f19 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -664,9 +664,16 @@ static const struct vkd3d_instance_application_meta application_override[] = {
+     { VKD3D_STRING_COMPARE_EXACT, "DXMD.exe", VKD3D_CONFIG_FLAG_STATIC(FORCE_INITIAL_TRANSITION) },
+     /* Dead Space (2023) (1693980) */
+     { VKD3D_STRING_COMPARE_EXACT, "Dead Space.exe", VKD3D_CONFIG_FLAG_STATIC(FORCE_DEDICATED_IMAGE_ALLOCATION) },
+-    /* Witcher 3 (2023) (292030). Misses ALLOW_REBUILD when querying for RTAS sizes. */
++    /* Witcher 3 (2023) (292030). Misses ALLOW_REBUILD when querying for RTAS sizes.
++     * RTAS_ALLOW_BLAS_REBUILD_SIZES alone is not sufficient: the game packs every BLAS build
++     * into a single, self-managed scratch buffer sized purely from what we report here, and the
++     * actual Vulkan scratch footprint at build time can still exceed that report by enough to
++     * stomp over the following BLAS's scratch region after tens of seconds of play, corrupting
++     * BVH data (Xid 109 / Xid 31 -> VK_ERROR_DEVICE_LOST). RTAS_SCALE_BLAS_SCRATCH_SIZES adds a
++     * conservative safety margin on top. See vkd3d-proton#3226. */
+     { VKD3D_STRING_COMPARE_EXACT, "witcher3.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(
+-            .DISABLE_SIMULTANEOUS_UAV_COMPRESSION = 1, .RTAS_ALLOW_BLAS_REBUILD_SIZES = 1) },
++            .DISABLE_SIMULTANEOUS_UAV_COMPRESSION = 1, .RTAS_ALLOW_BLAS_REBUILD_SIZES = 1,
++            .RTAS_SCALE_BLAS_SCRATCH_SIZES = 1) },
+     /* Age of Wonders 4 (1669000). Extremely stuttery performance with ReBAR. */
+     { VKD3D_STRING_COMPARE_EXACT, "AOW4.exe", VKD3D_CONFIG_FLAG_STATIC(NO_UPLOAD_HVV) },
+     /* Red Dead Redemption (2668510). Inconsistent performance with ReBAR at cutscenes of the game. */
+@@ -8940,6 +8947,27 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructureP
+         info->UpdateScratchDataSizeInBytes = size_info.updateScratchSize;
+     }
+
++    if (build_info.type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
++        VKD3D_CONFIG_FLAG_IS_SET(RTAS_SCALE_BLAS_SCRATCH_SIZES))
++    {
++        /* Witcher 3 packs every BLAS build into a single, self-managed scratch buffer using
++         * exactly the sizes we report here (see application_override[] above, vkd3d-proton#3226).
++         * If the real Vulkan scratch requirement at build time is even slightly larger than what
++         * vkGetAccelerationStructureBuildSizesKHR predicted here, a later BLAS build overwrites
++         * scratch memory the game still considers owned by an earlier one, corrupting BVH data.
++         * A scale of 8 is the largest value the community has needed to keep the game's full RT
++         * feature set (base RT, shadows, RTAO, RTXGI) stable; smaller factors were only verified
++         * safe with a subset of those features enabled.
++         *
++         * Deliberately not scaling ResultDataMaxSizeInBytes: the destination acceleration
++         * structure is created against the application's own backing resource
++         * (vkd3d_va_map_place_acceleration_structure() sizes it from resource->size, not from
++         * this query), and RTAS result storage is not part of the shared-scratch-buffer
++         * corruption this workaround targets, so inflating it would only cost VRAM for nothing. */
++        info->ScratchDataSizeInBytes *= 8;
++        info->UpdateScratchDataSizeInBytes *= 8;
++    }
++
+     TRACE("ResultDataMaxSizeInBytes: %"PRIu64".\n", info->ResultDataMaxSizeInBytes);
+     TRACE("ScratchDatSizeInBytes: %"PRIu64".\n", info->ScratchDataSizeInBytes);
+     TRACE("UpdateScratchDataSizeInBytes: %"PRIu64".\n", info->UpdateScratchDataSizeInBytes);
+--
+2.45.0

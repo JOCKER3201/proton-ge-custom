@@ -1,0 +1,82 @@
+From: Claude (Anthropic AI) <noreply@anthropic.com>
+Date: Fri, 5 Sep 2026 00:00:00 +0000
+Subject: [PATCH] winewayland: Don't require presentation ownership to stack a
+ covering client above the carrier.
+
+wayland_client_surface_should_stack_above_parent() refuses the
+stack-above-carrier path unless the client surface is the window's
+presentation owner. For Vulkan clients that election never runs on this
+path: wayland_client_surface_update_owner() is only reached from the
+client_surface destroy/detach/update callbacks and set_client_surface(),
+and the "presentation owner X -> Y" trace never fires for a D3D12 title.
+
+The check therefore rejects every Vulkan game and forces transparent
+punch-through compositing. On compositors that skip the parent/child blend
+for fullscreen windows the client content never reaches the screen, which
+reproduces the fullscreen black screen this series was meant to fix
+(Cyberpunk 2077 and The Witcher 3 on Hyprland, native Wayland, both SDR and
+HDR; XWayland and windowed mode unaffected).
+
+Instrumenting the predicate showed presentation_owner as the sole rejecting
+condition, 5639 times in a single run, with geometry already perfect
+(window and client rects both 3840x2160).
+
+Drop it as a requirement and keep it only as trace output. The remaining
+conditions - single toplevel client, no GDI content over the producer, no
+alpha, not layered/shaped/minimised, window rect equal to client rect, no
+dmabuf stack below - already constrain this to the intended case. The
+predicate now also reports which condition rejected it, so future reports
+name a specific check instead of guesswork.
+---
+ dlls/winewayland.drv/wayland_surface.c | 40 ++++++++++++++++++++------
+ 1 file changed, 31 insertions(+), 9 deletions(-)
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2477,19 +2477,36 @@
+         struct wayland_surface *surface, struct wayland_client_surface *client,
+         HWND hwnd, HWND toplevel, BOOL content_over_producer)
+ {
+-    if (!ReadAcquire(&client->client.presentation_owner)) return FALSE;
++    BOOL owner = !!ReadAcquire(&client->client.presentation_owner);
++    const char *reject = NULL;
++
+     /* A single opaque client surface covering the whole toplevel can sit above
+-     * an opaque parent carrier without using transparent punch-through. */
+-    if (hwnd != toplevel) return FALSE;
+-    if (content_over_producer || ReadAcquire(&client->has_alpha)) return FALSE;
+-    if (surface->window.exstyle & WS_EX_LAYERED) return FALSE;
+-    if (!wayland_surface_is_toplevel(surface) || surface->window.minimized) return FALSE;
++     * an opaque parent carrier without using transparent punch-through.
++     *
++     * presentation_owner is deliberately NOT required here: for Vulkan clients
++     * the ownership election never runs on this path, so requiring it kept
++     * every D3D12/Vulkan game on punch-through and black-screened them on
++     * compositors that skip the parent/child blend in fullscreen. The
++     * remaining checks already constrain this to a single, opaque,
++     * fully-covering toplevel client. */
++    if (hwnd != toplevel) reject = "hwnd != toplevel";
++    else if (content_over_producer) reject = "content_over_producer";
++    else if (ReadAcquire(&client->has_alpha)) reject = "has_alpha";
++    else if (surface->window.exstyle & WS_EX_LAYERED) reject = "WS_EX_LAYERED";
++    else if (!wayland_surface_is_toplevel(surface)) reject = "not toplevel";
++    else if (surface->window.minimized) reject = "minimized";
+     /* The outer Win32 rect may retain stale frame extents across a fullscreen
+      * transition; classify coverage against the Wayland presentation rect. */
+-    if (!EqualRect(&surface->window.rect, &surface->window.client_rect)) return FALSE;
+-    if (surface->shaped) return FALSE;
+-    if (wayland_surface_dmabuf_stack_bottom(surface)) return FALSE;
+-    return TRUE;
++    else if (!EqualRect(&surface->window.rect, &surface->window.client_rect)) reject = "rect != client_rect";
++    else if (surface->shaped) reject = "shaped";
++    else if (wayland_surface_dmabuf_stack_bottom(surface)) reject = "dmabuf_stack_bottom";
++
++    TRACE("hwnd=%p stack_above=%d reject=%s owner=%d window=%s client=%s\n",
++          hwnd, !reject, reject ? reject : "(none)", owner,
++          wine_dbgstr_rect(&surface->window.rect),
++          wine_dbgstr_rect(&surface->window.client_rect));
++
++    return !reject;
+ }
+ 
+ static void wayland_client_surface_stack(struct wayland_surface *surface,
