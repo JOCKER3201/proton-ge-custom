@@ -1,0 +1,87 @@
+From: Claude (Anthropic AI) <noreply@anthropic.com>
+Date: Sat, 6 Sep 2026 01:00:00 +0000
+Subject: [PATCH] winewayland: Don't infer a fullscreen request from
+ compositor-imposed geometry.
+
+wayland_win_data_is_fullscreen() treats any borderless window that covers the
+monitor as an application asking for fullscreen ("The fullscreen state is
+implied by the window position and style"). On a tiling compositor that
+inference is wrong: the compositor resizes ordinary windows to fill their tile,
+winewayland propagates that size to the Win32 window, and the next call reads
+the result back as a fullscreen request. wayland_win_data_get_config() then
+sets WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN and update_window_surface_state()
+sends xdg_toplevel_set_fullscreen() for a window that never wanted it.
+
+Observed with the Cyberpunk 2077 REDlauncher under Hyprland: an 854x512 logical
+launcher window is tiled to the full output and latches into fullscreen, where
+it also black-screens because a fullscreen surface takes the punch-through
+path. Trace of the xdg_toplevel configure states:
+
+  (0,0)-(0,0),      0x4   TILED
+  (0,0)-(1281,768), 0x5   TILED|MAXIMIZED   <- correct size
+  (0,0)-(3840,2160),0xd   FULLSCREEN|TILED|MAXIMIZED, 25ms later
+
+Note that keying off the TILED state alone is not sufficient, and would
+regress real fullscreen: a genuinely fullscreen game receives TILED too. In the
+same session Cyberpunk2077.exe went 0x4 -> 0xd while REDlauncher.exe went
+0x4/0x5 -> 0xd. The two cases are indistinguishable by state flags; they differ
+only in causality. An application that wants fullscreen resizes itself, which
+does not arrive through a configure, so record whether the current geometry was
+applied while processing a compositor configure and suppress the inference only
+in that case. Surfaces the compositor has already placed in the fullscreen
+state are left alone, so a window stays fullscreen once it legitimately gets
+there.
+
+NOTE: reviewed against the traces above but not yet built or exercised on
+hardware. The regression to check first is that games still enter fullscreen.
+
+Authored by Claude (Anthropic AI) at the request of the repository owner.
+---
+ dlls/winewayland.drv/waylanddrv.h |  3 +++
+ dlls/winewayland.drv/window.c     | 16 ++++++++++++++++
+ 2 files changed, 19 insertions(+)
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -685,6 +685,9 @@
+     /* window rects, relative to parent client area */
+     struct window_rects rects;
+     BOOL is_fullscreen;
++    /* The current geometry was imposed by a compositor configure rather than
++     * requested by the application. */
++    BOOL size_from_config;
+     BOOL managed;
+     BOOL layered_attribs_set;
+     int ime_ref;
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -182,6 +182,17 @@
+     RECT rect;
+ 
+     if (!data->is_fullscreen) return FALSE;
++    /* A tiling compositor resizes ordinary windows to cover the whole output.
++     * That geometry is imposed, not requested, so it must not be mistaken for
++     * an application asking to go fullscreen: acting on it makes us send
++     * xdg_toplevel_set_fullscreen() for windows that never wanted it, and the
++     * window then latches into a state it cannot leave. Applications that do
++     * want fullscreen resize themselves, which does not arrive through a
++     * configure, and surfaces the compositor has already placed in the
++     * fullscreen state keep it. */
++    if (data->size_from_config && data->wayland_surface &&
++        !(data->wayland_surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
++        return FALSE;
+     if (!(style & WS_POPUP) &&
+         (style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME))
+         return FALSE;
+@@ -1008,6 +1019,11 @@
+ 
+     data->rects = *new_rects;
+     data->is_fullscreen = fullscreen;
++    /* Record whether this geometry is being applied on behalf of a compositor
++     * configure, so that a compositor-imposed size is not later read back as an
++     * application request to go fullscreen. */
++    data->size_from_config = data->wayland_surface &&
++                             data->wayland_surface->processing.serial != 0;
+     data->managed = managed;
+ 
+     if (!surface)

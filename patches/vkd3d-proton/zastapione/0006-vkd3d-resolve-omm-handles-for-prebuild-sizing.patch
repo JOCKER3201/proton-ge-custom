@@ -1,0 +1,125 @@
+From: Claude (Anthropic AI) <noreply@anthropic.com>
+Date: Sat, 6 Sep 2026 11:30:00 +0000
+Subject: [PATCH] vkd3d: Resolve OMM handles for prebuild sizing too.
+
+The EXT opacity micromap linkage converter leaves micromap == VK_NULL_HANDLE
+and defers resolution to vkd3d_acceleration_structure_resolve_omm_va_maps_ext,
+which is called from exactly one place: the command recording path. The size
+query in d3d12_device_GetRaytracingAccelerationStructurePrebuildInfo never
+calls it.
+
+usageCountsCount is zero on both paths by default, deliberately, so that the
+two cannot disagree about the histogram. That leaves the linkage handle as the
+only channel by which the driver can learn a BLAS carries micromaps at all --
+and it disagrees: NULL when the application asks how much memory to allocate,
+live when the build actually runs. ResultDataMaxSizeInBytes and
+ScratchDataSizeInBytes come back short by the whole micromap overhead, the
+application allocates exactly that, and vkCmdBuildAccelerationStructuresKHR
+writes past the end of its own suballocation into whatever shares the RTAS
+heap. The corrupted BVH then faults during traversal some seconds later, with
+no error reported in between.
+
+Observed as VK_ERROR_DEVICE_LOST while Cyberpunk 2077 streams in the world,
+94 occurrences in one run, ~4.4s after the last micromap build and with no
+vkd3d error or warning between the two. Runs that touched micromaps on only
+two threads did not crash; runs that touched them on eight or nine did.
+
+KHR does not have this problem, because there the micromap is itself an
+acceleration structure whose size the driver can read at query time, which is
+why the KHR backend can legitimately pass VK_NULL_HANDLE here. The EXT object
+is not introspectable while sizing. The upstream EXT backend that shipped for
+three years resolved the handle inside the converter for exactly this reason;
+its comment said so out loud: "For prebuild info, we need the pointers right
+away however." This fallback took the deferred-resolve shape from the KHR
+rewrite and lost that property.
+
+Sizing is made best effort: an unresolvable VA there costs accuracy for one
+geometry, whereas failing the query outright would report the size of a BLAS
+with no micromaps, which is the very undersizing being fixed. Recording stays
+hard. Overshooting is harmless -- the application may allocate more than it
+needs -- so the only dangerous direction is closed.
+
+Authored by Claude (Anthropic AI) at the request of the repository owner,
+from a fleet analysis of the device-lost traces.
+---
+ libs/vkd3d/command.c          |  2 +-
+ libs/vkd3d/device.c           | 14 ++++++++++++++
+ libs/vkd3d/opacity_micromap.c | 12 ++++++++++--
+ libs/vkd3d/vkd3d_private.h    |  3 ++-
+ 4 files changed, 27 insertions(+), 4 deletions(-)
+
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -21903,7 +21903,7 @@
+     if (d3d12_device_uses_ext_opacity_micromap(list->device))
+     {
+         if (!vkd3d_acceleration_structure_resolve_omm_va_maps_ext(list->device, &desc->Inputs,
+-                omm_triangles_infos.ext))
++                omm_triangles_infos.ext, false))
+             return;
+     }
+     else if (!vkd3d_acceleration_structure_resolve_omm_va_maps(list->device, &desc->Inputs,
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9105,6 +9105,20 @@
+         goto cleanup;
+     }
+ 
++    /* VK_EXT_opacity_micromap cannot tell a size query that a BLAS carries micromaps by any route
++     * other than the linkage handle: usageCounts is empty by default and VkMicromapEXT is not
++     * introspectable while sizing. Leaving micromap == VK_NULL_HANDLE here therefore answers for a
++     * BLAS with no micromaps at all, while command recording resolves a live handle and needs more
++     * room -- and the application allocates from this query, so the build then runs off the end of
++     * its own suballocation. Resolve here too, best effort, so both size queries see the same
++     * chain. The KHR linkage carries its size in the micromap acceleration structure itself and
++     * does not need this, hence the backend gate. */
++    if (d3d12_device_uses_ext_opacity_micromap(device))
++    {
++        vkd3d_acceleration_structure_resolve_omm_va_maps_ext(device, desc,
++                omm_triangles_infos.ext, true);
++    }
++
+     if (build_info.type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
+         VKD3D_CONFIG_FLAG_IS_SET(RTAS_ALLOW_BLAS_REBUILD_SIZES))
+     {
+--- a/libs/vkd3d/opacity_micromap.c
++++ b/libs/vkd3d/opacity_micromap.c
+@@ -703,7 +703,8 @@
+ 
+ bool vkd3d_acceleration_structure_resolve_omm_va_maps_ext(struct d3d12_device *device,
+         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
+-        VkAccelerationStructureTrianglesOpacityMicromapEXT *omm_triangles_infos)
++        VkAccelerationStructureTrianglesOpacityMicromapEXT *omm_triangles_infos,
++        bool best_effort)
+ {
+     const D3D12_RAYTRACING_GEOMETRY_DESC *geom_desc;
+     D3D12_GPU_VIRTUAL_ADDRESS va;
+@@ -729,7 +730,15 @@
+         omm_triangles_infos[i].micromap = vkd3d_va_map_place_opacity_micromap_ext(
+                 &device->memory_allocator.va_map, device, va);
+         if (omm_triangles_infos[i].micromap == VK_NULL_HANDLE)
+-            return false;
++        {
++            /* Size queries must keep going. A VA we cannot place yet only costs accuracy for that
++             * one geometry, whereas bailing out would answer for a BLAS with no micromaps at all,
++             * which is the very undersizing this resolve exists to prevent. Command recording has
++             * no such excuse and stays hard. */
++            if (!best_effort)
++                return false;
++            WARN("Failed to place OMM at VA %"PRIx64" while sizing; result may be undersized.\n", va);
++        }
+     }
+ 
+     return true;
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -7133,7 +7133,8 @@
+         VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos);
+ bool vkd3d_acceleration_structure_resolve_omm_va_maps_ext(struct d3d12_device *device,
+         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
+-        VkAccelerationStructureTrianglesOpacityMicromapEXT *omm_triangles_infos);
++        VkAccelerationStructureTrianglesOpacityMicromapEXT *omm_triangles_infos,
++        bool best_effort);
+ void vkd3d_acceleration_structure_flush_postbuild_batch(struct d3d12_command_list *list,
+         const struct vk_acceleration_structure_postbuild_info *infos, size_t count);
+ void vkd3d_acceleration_structure_write_postbuild_info(

@@ -316,6 +316,24 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Keep builtin AMD AGS ahead of the native-version heuristic"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-keep-builtin-amd-ags-ahead-of-version-heuristic.patch"
 
+    # Fixes wine-wayland/0242-winewayland-Remove-output_info-structure.patch, which
+    # hand-expanded COPY(w_x)/COPY(w_y) with the wrong arguments, so every output's
+    # white point equalled its blue primary. Made HDR content render violet.
+    echo "WINE: -HOTFIX- Store the white point, not the blue primary"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-store-the-white-point-not-the-blue-primary.patch"
+
+    # Fixes wineland-child-rendering/0036-winewayland-Avoid-win-data-lookup-in-set-clip.patch,
+    # which turned set_clip into a full window-state update and made compositor-maximized
+    # borderless windows (Cyberpunk 2077 REDlauncher under Hyprland) go fullscreen.
+    echo "WINE: -HOTFIX- Sync regions from set_clip without rerunning the window state update"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-set-clip-sync-regions-without-window-state-update.patch"
+
+    # Companion to the patch above: that one removes one path that re-enters
+    # wayland_win_data_get_config() after the configure was processed, this one
+    # fixes the misclassification itself, so any remaining path is harmless.
+    echo "WINE: -HOTFIX- Don't infer a fullscreen request from compositor-imposed geometry"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-dont-infer-fullscreen-from-imposed-geometry.patch"
+
 ### END WINE HOTFIX/BACKPORT SECTION ###
 
 ### (2-6) WINE PENDING UPSTREAM SECTION ###

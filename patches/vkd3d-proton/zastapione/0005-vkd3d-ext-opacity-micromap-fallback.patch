@@ -1,0 +1,2160 @@
+From: Claude (Anthropic AI) <noreply@anthropic.com>
+Subject: [PATCH] vkd3d: Restore VK_EXT_opacity_micromap as a fallback backend.
+
+Opacity micromaps are gated on VK_KHR_opacity_micromap, which is very new;
+drivers that only expose the older VK_EXT_opacity_micromap report no OMM
+support at all. Upstream removed the EXT backend deliberately (3c3b1deb and
+following) to simplify the code, accepting that EXT-only devices lose the
+feature. This restores it as a fallback.
+
+KHR remains the first choice. EXT is selected only when the device does not
+expose KHR, via using_khr_opacity_micromap; on a KHR-capable device every new
+block is dead and the existing code path is unchanged. That property was
+audited three times over the course of development.
+
+The two extensions do not share an object model: KHR builds a micromap as an
+acceleration structure with type OPACITY_MICROMAP_KHR, while EXT has a
+separate VkMicromapEXT with its own create/build/size entry points. The EXT
+side therefore needs its own object lifetime, va_map tracking and build
+dispatch rather than a constant swap.
+
+Per-geometry usage counts on BLAS linkage are left at zero by default, which
+is what the original EXT backend did for the three years it was the only
+backend. A real histogram, recorded when the OMM array is built, can be
+enabled with VKD3D_CONFIG=omm_ext_linkage_usage_counts.
+
+NOTE: this has been reviewed but never built or exercised on hardware.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+diff --git a/include/private/config_flag_decl.h b/include/private/config_flag_decl.h
+--- a/include/private/config_flag_decl.h
++++ b/include/private/config_flag_decl.h
+@@ -72,3 +72,10 @@ VKD3D_DECL_CONFIG("disallow_committed_texture_suballocation", DISALLOW_COMMITTED
+ VKD3D_DECL_CONFIG("allow_image_heap_suballocation", ALLOW_IMAGE_HEAP_SUBALLOCATION)
+ VKD3D_DECL_CONFIG("debug_wave64_simulation", DEBUG_WAVE64_SIMULATION)
+ VKD3D_DECL_CONFIG("fail_unsupported_state_template", FAIL_UNSUPPORTED_STATE_TEMPLATE)
++/* Opt-in: republish the remembered OMM usage histogram on VK_EXT_opacity_micromap BLAS linkage.
++ * Off by default, i.e. usageCountsCount = 0, which is what the upstream EXT backend shipped before
++ * it was removed. It has to stay off by default because D3D12 never hands us a histogram on the
++ * linkage itself: a prebuild sizing query issued before the OMM array build is recorded observes 0
++ * while the later build would observe N, and the two must agree. Experimental, for A/B testing
++ * against a real EXT-only driver. No effect on the KHR backend. */
++VKD3D_DECL_CONFIG("omm_ext_linkage_usage_counts", OMM_EXT_LINKAGE_USAGE_COUNTS)
+diff --git a/include/private/config_flags.h b/include/private/config_flags.h
+--- a/include/private/config_flags.h
++++ b/include/private/config_flags.h
+@@ -31,7 +31,7 @@ struct vkd3d_config_flags_bitfield
+ 	 * we may end up with stray uninitialized bits which can subtly break bitwise operations later.
+ 	 * Adding more configs will cause the static assert below to fail,
+ 	 * which indicates the need to subtract a reserved bit. */
+-	uint32_t reserved0 : 23;
++	uint32_t reserved0 : 22;
+ };
+ 
+ STATIC_ASSERT(sizeof(struct vkd3d_config_flags_bitfield) == 12);
+diff --git a/libs/vkd3d/acceleration_structure.c b/libs/vkd3d/acceleration_structure.c
+--- a/libs/vkd3d/acceleration_structure.c
++++ b/libs/vkd3d/acceleration_structure.c
+@@ -117,7 +117,7 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
+         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
+         VkAccelerationStructureBuildGeometryInfoKHR *build_info,
+         VkAccelerationStructureGeometryKHR *geometry_infos,
+-        VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos,
++        const union vkd3d_omm_triangles_info *omm_triangles_infos,
+         VkAccelerationStructureBuildRangeInfoKHR *range_infos,
+         uint32_t *primitive_counts)
+ {
+@@ -125,8 +125,11 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
+     const D3D12_RAYTRACING_GEOMETRY_DESC *geom_desc;
+     bool have_triangles, have_aabbs;
+     uint32_t primitive_count;
++    bool uses_ext_omm;
+     unsigned int i;
+ 
++    uses_ext_omm = d3d12_device_uses_ext_opacity_micromap(device);
++
+     RT_TRACE("Converting inputs.\n");
+     RT_TRACE("=====================\n");
+ 
+@@ -159,8 +162,13 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
+         /* There is risk of desc->NumDescs being != 1, although it should not happen. */
+         memset(geometry_infos, 0, sizeof(*geometry_infos));
+         /* Safety since we check for sentinel when completing batch. */
+-        if (omm_triangles_infos)
+-            memset(omm_triangles_infos, 0, sizeof(*omm_triangles_infos));
++        if (uses_ext_omm)
++        {
++            if (omm_triangles_infos->ext)
++                memset(omm_triangles_infos->ext, 0, sizeof(*omm_triangles_infos->ext));
++        }
++        else if (omm_triangles_infos->khr)
++            memset(omm_triangles_infos->khr, 0, sizeof(*omm_triangles_infos->khr));
+         geometry_infos[0].sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+         geometry_infos[0].geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+         geometry_infos[0].geometry.instances.sType =
+@@ -192,8 +200,13 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
+ 
+         /* Don't hoist this memset since top-level geometries forces NumDescs == 1 assumption. */
+         memset(geometry_infos, 0, sizeof(*geometry_infos) * desc->NumDescs);
+-        if (omm_triangles_infos)
+-            memset(omm_triangles_infos, 0, sizeof(*omm_triangles_infos) * desc->NumDescs);
++        if (uses_ext_omm)
++        {
++            if (omm_triangles_infos->ext)
++                memset(omm_triangles_infos->ext, 0, sizeof(*omm_triangles_infos->ext) * desc->NumDescs);
++        }
++        else if (omm_triangles_infos->khr)
++            memset(omm_triangles_infos->khr, 0, sizeof(*omm_triangles_infos->khr) * desc->NumDescs);
+         if (primitive_counts)
+             memset(primitive_counts, 0, sizeof(*primitive_counts) * desc->NumDescs);
+ 
+@@ -269,8 +282,16 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
+                     vkd3d_acceleration_structure_convert_triangles(device,
+                             geom_desc->OmmTriangles.pTriangles, &geometry_infos[i], &primitive_count);
+ 
+-                    if (!vkd3d_acceleration_structure_convert_opacity_micromap(device,
+-                            geom_desc, &geometry_infos[i], &omm_triangles_infos[i]))
++                    if (uses_ext_omm)
++                    {
++                        if (!vkd3d_acceleration_structure_convert_opacity_micromap_ext(device,
++                                geom_desc, &geometry_infos[i], &omm_triangles_infos->ext[i]))
++                        {
++                            return false;
++                        }
++                    }
++                    else if (!vkd3d_acceleration_structure_convert_opacity_micromap(device,
++                            geom_desc, &geometry_infos[i], &omm_triangles_infos->khr[i]))
+                     {
+                         return false;
+                     }
+@@ -321,6 +342,16 @@ static void vkd3d_acceleration_structure_begin_query_barrier(struct d3d12_comman
+     if (uav_incoming)
+         barrier.srcStageMask |= vk_queue_shader_stages(list->device, list->vk_queue_flags);
+ 
++    /* The postbuild batch is shared between acceleration structures and micromaps, and EXT micromaps
++     * are only reachable through the MICROMAP access bits. */
++    if (d3d12_device_uses_ext_opacity_micromap(list->device))
++    {
++        barrier.srcStageMask |= VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT;
++        barrier.srcAccessMask |= VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT;
++        barrier.dstStageMask |= VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT;
++        barrier.dstAccessMask |= VK_ACCESS_2_MICROMAP_READ_BIT_EXT;
++    }
++
+     memset(&dep_info, 0, sizeof(dep_info));
+     dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+     dep_info.memoryBarrierCount = 1;
+@@ -518,27 +549,35 @@ void vkd3d_acceleration_structure_flush_postbuild_batch(struct d3d12_command_lis
+     size_t i;
+ 
+     for (i = 0; i < count && !has_incoming_uav; i++)
+-        has_incoming_uav = infos[i].rtas_vk == VK_NULL_HANDLE;
++        has_incoming_uav = infos[i].rtas_vk.rtas == VK_NULL_HANDLE;
+ 
+     vkd3d_acceleration_structure_begin_query_barrier(list, has_incoming_uav);
+     for (i = 0; i < count; i++)
+     {
+         const struct vk_acceleration_structure_postbuild_info *info = &infos[i];
+ 
+-        if (info->rtas_vk == VK_NULL_HANDLE)
++        if (info->rtas_vk.rtas == VK_NULL_HANDLE)
+         {
+             /* Generic query path. */
+             vkd3d_acceleration_structure_emit_postbuild_info(list, &info->desc, info->rtas_va);
+         }
+         else if (info->is_omm)
+         {
+-            vkd3d_opacity_micromap_emit_immediate_postbuild_info(list, 1, &info->desc,
+-                    info->rtas_va, info->rtas_vk);
++            if (d3d12_device_uses_ext_opacity_micromap(list->device))
++            {
++                vkd3d_opacity_micromap_emit_immediate_postbuild_info_ext(list, 1, &info->desc,
++                        info->rtas_va, info->rtas_vk.micromap_ext);
++            }
++            else
++            {
++                vkd3d_opacity_micromap_emit_immediate_postbuild_info(list, 1, &info->desc,
++                        info->rtas_va, info->rtas_vk.rtas);
++            }
+         }
+         else
+         {
+             vkd3d_acceleration_structure_write_postbuild_info(
+-                    list, &info->desc, info->rtas_vk, info->rtas_va, info->rtas_kind);
++                    list, &info->desc, info->rtas_vk.rtas, info->rtas_va, info->rtas_kind);
+         }
+     }
+     vkd3d_acceleration_structure_end_query_barrier(list);
+diff --git a/libs/vkd3d/breadcrumbs.c b/libs/vkd3d/breadcrumbs.c
+--- a/libs/vkd3d/breadcrumbs.c
++++ b/libs/vkd3d/breadcrumbs.c
+@@ -75,6 +75,8 @@ static const char *vkd3d_breadcrumb_command_type_to_str(enum vkd3d_breadcrumb_co
+             return "build_rtas";
+         case VKD3D_BREADCRUMB_COMMAND_BUILD_OMM:
+             return "build_omm";
++        case VKD3D_BREADCRUMB_COMMAND_COPY_OMM:
++            return "copy_omm";
+         case VKD3D_BREADCRUMB_COMMAND_COPY_RTAS:
+             return "copy_rtas";
+         case VKD3D_BREADCRUMB_COMMAND_EMIT_RTAS_POSTBUILD:
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -6461,6 +6461,14 @@ static void vk_access_and_stage_flags_from_d3d12_resource_state(const struct d3d
+                     *stages |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+                     *access |= VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                             VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
++
++                    /* VkMicromapEXT accesses are not covered by the acceleration structure bits. */
++                    if (d3d12_device_uses_ext_opacity_micromap(device))
++                    {
++                        *stages |= VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT;
++                        *access |= VK_ACCESS_2_MICROMAP_READ_BIT_EXT |
++                                VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT;
++                    }
+                 }
+                 break;
+ 
+@@ -6472,6 +6480,14 @@ static void vk_access_and_stage_flags_from_d3d12_resource_state(const struct d3d
+                             VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                     *access |= VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                             VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
++
++                    /* OMM arrays live in this state too, and on EXT they are their own object type. */
++                    if (d3d12_device_uses_ext_opacity_micromap(device))
++                    {
++                        *stages |= VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT;
++                        *access |= VK_ACCESS_2_MICROMAP_READ_BIT_EXT |
++                                VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT;
++                    }
+                 }
+                 break;
+ 
+@@ -6498,6 +6514,10 @@ static void vk_access_and_stage_flags_from_d3d12_resource_state(const struct d3d
+                     /* Vertex / index / transform buffer inputs are NON_PIXEL_SHADER_RESOURCES in DXR.
+                      * They access SHADER_READ_BIT in Vulkan, so just need to add the stage. */
+                     *stages |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
++
++                    /* Same reasoning for the OMM input and per-OMM descriptor buffers. */
++                    if (d3d12_device_uses_ext_opacity_micromap(device))
++                        *stages |= VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT;
+                 }
+                 break;
+ 
+@@ -21195,11 +21215,11 @@ static void d3d12_command_list_free_rtas_batch(struct d3d12_command_list *list)
+ 
+     vkd3d_free(rtas_batch->build_infos);
+     vkd3d_free(rtas_batch->geometry_infos);
+-    vkd3d_free(rtas_batch->omm_triangles_infos);
++    vkd3d_free(rtas_batch->omm_triangles_infos.khr);
+     vkd3d_free(rtas_batch->range_infos);
+     vkd3d_free(rtas_batch->range_ptrs);
+-    vkd3d_free(rtas_batch->omm_build_infos);
+-    vkd3d_free(rtas_batch->omm_usage_infos);
++    vkd3d_free(rtas_batch->omm_build_infos.khr);
++    vkd3d_free(rtas_batch->omm_usage_infos.khr);
+     vkd3d_free(rtas_batch->scratch_usage);
+     vkd3d_free(rtas_batch->postbuild_infos);
+ }
+@@ -21215,7 +21235,9 @@ static bool d3d12_command_list_register_rtas_scratch_range(
+     {
+         if (max(rtas_batch->scratch_usage[i].va_start, scratch) < min(rtas_batch->scratch_usage[i].va_end, scratch_end))
+         {
+-            /* The last element is already allocated and we cannot submit that quite yet. */
++            /* The last element is already allocated and we cannot submit that quite yet.
++             * Only ever reached from the BLAS/TLAS path, so build_info_count is the right counter;
++             * OMM array builds deliberately do not register their scratch range. */
+             list->rtas_batch.build_info_count--;
+ 
+             WARN("Application bug detected. Attempting to use scratch which is currently in flight on GPU. Flushing batch.\n");
+@@ -21235,10 +21257,11 @@ static bool d3d12_command_list_register_rtas_scratch_range(
+ static bool d3d12_command_list_allocate_rtas_build_info(struct d3d12_command_list *list, uint32_t geometry_count,
+         VkAccelerationStructureBuildGeometryInfoKHR **build_info,
+         VkAccelerationStructureGeometryKHR **geometry_infos,
+-        VkAccelerationStructureTrianglesOpacityMicromapKHR **omm_triangles_infos,
++        union vkd3d_omm_triangles_info *omm_triangles_infos,
+         VkAccelerationStructureBuildRangeInfoKHR **range_infos)
+ {
+     struct d3d12_rtas_batch_state *rtas_batch = &list->rtas_batch;
++    bool uses_ext_omm = d3d12_device_uses_ext_opacity_micromap(list->device);
+ 
+     if (!vkd3d_array_reserve((void **)&rtas_batch->build_infos, &rtas_batch->build_info_size,
+             rtas_batch->build_info_count + 1, sizeof(*rtas_batch->build_infos)))
+@@ -21256,8 +21279,11 @@ static bool d3d12_command_list_allocate_rtas_build_info(struct d3d12_command_lis
+ 
+     if (list->device->device_info.supports_opacity_micromap)
+     {
+-        if (!vkd3d_array_reserve((void **)&rtas_batch->omm_triangles_infos, &rtas_batch->omm_triangles_info_size,
+-                rtas_batch->geometry_info_count + geometry_count, sizeof(*rtas_batch->omm_triangles_infos)))
++        /* The two backends disagree on the element size, so the reserve has to know which one is in use. */
++        if (!vkd3d_array_reserve((void **)&rtas_batch->omm_triangles_infos.khr, &rtas_batch->omm_triangles_info_size,
++                rtas_batch->geometry_info_count + geometry_count,
++                uses_ext_omm ? sizeof(*rtas_batch->omm_triangles_infos.ext) :
++                        sizeof(*rtas_batch->omm_triangles_infos.khr)))
+         {
+             ERR("Failed to allocate opacity micromap info array.\n");
+             return false;
+@@ -21273,10 +21299,12 @@ static bool d3d12_command_list_allocate_rtas_build_info(struct d3d12_command_lis
+ 
+     *build_info = &rtas_batch->build_infos[rtas_batch->build_info_count];
+     *geometry_infos = &rtas_batch->geometry_infos[rtas_batch->geometry_info_count];
+-    if (list->device->device_info.supports_opacity_micromap)
+-        *omm_triangles_infos = &rtas_batch->omm_triangles_infos[rtas_batch->geometry_info_count];
++    if (!list->device->device_info.supports_opacity_micromap)
++        omm_triangles_infos->khr = NULL;
++    else if (uses_ext_omm)
++        omm_triangles_infos->ext = &rtas_batch->omm_triangles_infos.ext[rtas_batch->geometry_info_count];
+     else
+-        *omm_triangles_infos = NULL;
++        omm_triangles_infos->khr = &rtas_batch->omm_triangles_infos.khr[rtas_batch->geometry_info_count];
+     *range_infos = &rtas_batch->range_infos[rtas_batch->geometry_info_count];
+ 
+     rtas_batch->build_info_count += 1;
+@@ -21307,15 +21335,15 @@ static bool d3d12_command_list_allocate_omm_build_info(struct d3d12_command_list
+         return false;
+     }
+ 
+-    if (!vkd3d_array_reserve((void **)&rtas_batch->omm_build_infos, &rtas_batch->omm_build_info_size,
+-            rtas_batch->omm_build_info_count + 1, sizeof(*rtas_batch->omm_build_infos)))
++    if (!vkd3d_array_reserve((void **)&rtas_batch->omm_build_infos.khr, &rtas_batch->omm_build_info_size,
++            rtas_batch->omm_build_info_count + 1, sizeof(*rtas_batch->omm_build_infos.khr)))
+     {
+         ERR("Failed to allocate omm build info array.\n");
+         return false;
+     }
+ 
+-    if (!vkd3d_array_reserve((void **)&rtas_batch->omm_usage_infos, &rtas_batch->omm_usage_info_size,
+-            rtas_batch->omm_usage_info_count + usage_count, sizeof(*rtas_batch->omm_usage_infos)))
++    if (!vkd3d_array_reserve((void **)&rtas_batch->omm_usage_infos.khr, &rtas_batch->omm_usage_info_size,
++            rtas_batch->omm_usage_info_count + usage_count, sizeof(*rtas_batch->omm_usage_infos.khr)))
+     {
+         ERR("Failed to allocate usage array.\n");
+         return false;
+@@ -21331,8 +21359,8 @@ static bool d3d12_command_list_allocate_omm_build_info(struct d3d12_command_list
+ 
+     *build_info = &rtas_batch->build_infos[rtas_batch->build_info_count];
+     *geometry_info = &rtas_batch->geometry_infos[rtas_batch->geometry_info_count];
+-    *geometry_micromap_data = &rtas_batch->omm_build_infos[rtas_batch->omm_build_info_count];
+-    *usage_infos = &rtas_batch->omm_usage_infos[rtas_batch->omm_usage_info_count];
++    *geometry_micromap_data = &rtas_batch->omm_build_infos.khr[rtas_batch->omm_build_info_count];
++    *usage_infos = &rtas_batch->omm_usage_infos.khr[rtas_batch->omm_usage_info_count];
+ 
+     rtas_batch->build_info_count += 1;
+     rtas_batch->geometry_info_count += 1;
+@@ -21342,6 +21370,49 @@ static bool d3d12_command_list_allocate_omm_build_info(struct d3d12_command_list
+     return true;
+ }
+ 
++/* VkMicromapBuildInfoEXT is submitted through its own vkCmdBuildMicromapsEXT dispatch, so unlike the
++ * KHR variant it must not consume a slot in build_infos / geometry_infos / range_infos. */
++static bool d3d12_command_list_allocate_omm_build_info_ext(struct d3d12_command_list *list, uint32_t usage_count,
++        VkMicromapBuildInfoEXT **build_info,
++        VkMicromapUsageEXT **usage_infos)
++{
++    struct d3d12_rtas_batch_state *rtas_batch = &list->rtas_batch;
++
++    if (!vkd3d_array_reserve((void **)&rtas_batch->omm_build_infos.ext, &rtas_batch->omm_build_info_size,
++            rtas_batch->omm_build_info_count + 1, sizeof(*rtas_batch->omm_build_infos.ext)))
++    {
++        ERR("Failed to allocate omm build info array.\n");
++        return false;
++    }
++
++    if (!vkd3d_array_reserve((void **)&rtas_batch->omm_usage_infos.ext, &rtas_batch->omm_usage_info_size,
++            rtas_batch->omm_usage_info_count + usage_count, sizeof(*rtas_batch->omm_usage_infos.ext)))
++    {
++        ERR("Failed to allocate usage array.\n");
++        return false;
++    }
++
++    *build_info = &rtas_batch->omm_build_infos.ext[rtas_batch->omm_build_info_count];
++    *usage_infos = &rtas_batch->omm_usage_infos.ext[rtas_batch->omm_usage_info_count];
++
++    rtas_batch->omm_build_info_count += 1;
++    rtas_batch->omm_usage_info_count += usage_count;
++
++    return true;
++}
++
++/* Unwinds the allocation above. The entry is always the last one in the batch, so this is a plain
++ * decrement. Mandatory on every path that gives up after allocating; otherwise
++ * d3d12_command_list_flush_rtas_batch submits a VkMicromapBuildInfoEXT that was never filled in,
++ * and dstMicromap is not optional. */
++static void d3d12_command_list_discard_omm_build_info_ext(struct d3d12_command_list *list, uint32_t usage_count)
++{
++    struct d3d12_rtas_batch_state *rtas_batch = &list->rtas_batch;
++
++    rtas_batch->omm_build_info_count -= 1;
++    rtas_batch->omm_usage_info_count -= usage_count;
++}
++
+ static void d3d12_command_list_clear_rtas_batch(struct d3d12_command_list *list)
+ {
+     struct d3d12_rtas_batch_state *rtas_batch = &list->rtas_batch;
+@@ -21384,7 +21455,45 @@ static void d3d12_command_list_fixup_rtas_batch(struct d3d12_command_list *list)
+         geometry_index += geometry_count;
+     }
+ 
+-    if (list->device->device_info.supports_opacity_micromap)
++    if (d3d12_device_uses_ext_opacity_micromap(list->device))
++    {
++        /* Assign usage count pointers. There is no geometry slot to patch up, since
++         * VkMicromapBuildInfoEXT is a top level structure rather than a geometry pNext link. */
++        usage_index = 0;
++
++        for (i = 0; i < rtas_batch->omm_build_info_count; i++)
++        {
++            uint32_t usage_count = rtas_batch->omm_build_infos.ext[i].usageCountsCount;
++            assert(usage_index + usage_count <= rtas_batch->omm_usage_info_count);
++
++            rtas_batch->omm_build_infos.ext[i].pUsageCounts = &rtas_batch->omm_usage_infos.ext[usage_index];
++
++            usage_index += usage_count;
++        }
++
++        /* pNext pointers on Geometry AS. Currently limited to Opacity micromaps */
++        if (rtas_batch->omm_triangles_infos.ext)
++        {
++            for (i = 0; i < rtas_batch->geometry_info_count; i++)
++            {
++                VkAccelerationStructureGeometryKHR *geometry = &rtas_batch->geometry_infos[i];
++                VkAccelerationStructureTrianglesOpacityMicromapEXT *omm_ext = &rtas_batch->omm_triangles_infos.ext[i];
++
++                /* The KHR sentinel (a non-NULL triangles pNext) cannot be used here, because the
++                 * linkage array is not what geometry.triangles.pNext ends up pointing at while the
++                 * array is still being reallocated. The zeroed sType is the sentinel instead. */
++                if (omm_ext->sType == VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT)
++                {
++                    assert(geometry->geometry.triangles.sType == VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR);
++                    assert(geometry->sType == VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR);
++                    assert(geometry->geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR);
++                    geometry->geometry.triangles.pNext = NULL;
++                    vk_prepend_struct(&geometry->geometry.triangles, omm_ext);
++                }
++            }
++        }
++    }
++    else if (list->device->device_info.supports_opacity_micromap)
+     {
+         /* Assign geometry info next pointers */
+         uint32_t omm_index = 0;
+@@ -21397,7 +21506,7 @@ static void d3d12_command_list_fixup_rtas_batch(struct d3d12_command_list *list)
+ 
+             if (rtas_batch->geometry_infos[geometry_index].geometryType == VK_GEOMETRY_TYPE_MICROMAP_KHR)
+             {
+-                rtas_batch->geometry_infos[geometry_index].pNext = &rtas_batch->omm_build_infos[omm_index];
++                rtas_batch->geometry_infos[geometry_index].pNext = &rtas_batch->omm_build_infos.khr[omm_index];
+                 omm_index += 1;
+             }
+ 
+@@ -21409,21 +21518,21 @@ static void d3d12_command_list_fixup_rtas_batch(struct d3d12_command_list *list)
+ 
+         for (i = 0; i < rtas_batch->omm_build_info_count; i++)
+         {
+-            uint32_t usage_count = rtas_batch->omm_build_infos[i].usageCountsCount;
++            uint32_t usage_count = rtas_batch->omm_build_infos.khr[i].usageCountsCount;
+             assert(usage_index + usage_count <= rtas_batch->omm_usage_info_count);
+ 
+-            rtas_batch->omm_build_infos[i].pUsageCounts = &rtas_batch->omm_usage_infos[usage_index];
++            rtas_batch->omm_build_infos.khr[i].pUsageCounts = &rtas_batch->omm_usage_infos.khr[usage_index];
+ 
+             usage_index += usage_count;
+         }
+ 
+         /* pNext pointers on Geometry AS. Currently limited to Opacity micromaps */
+-        if (rtas_batch->omm_triangles_infos)
++        if (rtas_batch->omm_triangles_infos.khr)
+         {
+             for (i = 0; i < rtas_batch->geometry_info_count; i++)
+             {
+                 VkAccelerationStructureGeometryKHR *geometry = &rtas_batch->geometry_infos[i];
+-                VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_khr = &rtas_batch->omm_triangles_infos[i];
++                VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_khr = &rtas_batch->omm_triangles_infos.khr[i];
+ 
+                 if (geometry->geometry.triangles.pNext)
+                 {
+@@ -21444,7 +21553,9 @@ static void d3d12_command_list_flush_rtas_batch(struct d3d12_command_list *list)
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+     struct d3d12_rtas_batch_state *rtas_batch = &list->rtas_batch;
+ 
+-    if (rtas_batch->build_info_count)
++    /* On the KHR backend omm_build_info_count > 0 implies build_info_count > 0, since the two are
++     * allocated in lockstep. On the EXT backend a batch may consist of micromap builds only. */
++    if (rtas_batch->build_info_count || rtas_batch->omm_build_info_count)
+     {
+         d3d12_command_list_check_end_of_command_list_cleanup(list);
+ 
+@@ -21455,8 +21566,23 @@ static void d3d12_command_list_flush_rtas_batch(struct d3d12_command_list *list)
+         d3d12_command_list_end_current_render_pass(list, true);
+         d3d12_command_list_end_transfer_batch(list, false);
+ 
+-        VK_CALL(vkCmdBuildAccelerationStructuresKHR(list->cmd.vk_command_buffer,
+-                rtas_batch->build_info_count, rtas_batch->build_infos, rtas_batch->range_ptrs));
++        /* A batch never mixes the two: d3d12_command_list_build_raytracing_acceleration_structure
++         * flushes on a build type change (see assume_hazard), so either omm_build_info_count or
++         * build_info_count is zero here. Recording order alone would not create the dependency an
++         * OMM array feeding a BLAS needs - that is what d3d12_command_list_flush_rtas_barrier is
++         * for - so if a mixed batch ever becomes possible, a barrier has to be inserted between
++         * these two dispatches. */
++        if (rtas_batch->omm_build_info_count && d3d12_device_uses_ext_opacity_micromap(list->device))
++        {
++            VK_CALL(vkCmdBuildMicromapsEXT(list->cmd.vk_command_buffer,
++                    rtas_batch->omm_build_info_count, rtas_batch->omm_build_infos.ext));
++        }
++
++        if (rtas_batch->build_info_count)
++        {
++            VK_CALL(vkCmdBuildAccelerationStructuresKHR(list->cmd.vk_command_buffer,
++                    rtas_batch->build_info_count, rtas_batch->build_infos, rtas_batch->range_ptrs));
++        }
+ 
+         VKD3D_BREADCRUMB_COMMAND(BUILD_RTAS);
+     }
+@@ -21493,6 +21619,16 @@ static void d3d12_command_list_flush_rtas_barrier(struct d3d12_command_list *lis
+     vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+     vk_barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+ 
++    /* An OMM array build feeding a BLAS build needs a MICROMAP_WRITE -> MICROMAP_READ dependency on
++     * the EXT backend; the acceleration structure access bits do not cover VkMicromapEXT.
++     * ACCELERATION_STRUCTURE_BUILD is a legal stage for MICROMAP_READ, so dstStageMask already fits. */
++    if (d3d12_device_uses_ext_opacity_micromap(list->device))
++    {
++        vk_barrier.srcStageMask |= VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT;
++        vk_barrier.srcAccessMask |= VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT;
++        vk_barrier.dstAccessMask |= VK_ACCESS_2_MICROMAP_READ_BIT_EXT;
++    }
++
+     memset(&dep_info, 0, sizeof(dep_info));
+     dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+     dep_info.memoryBarrierCount = 1;
+@@ -21502,6 +21638,124 @@ static void d3d12_command_list_flush_rtas_barrier(struct d3d12_command_list *lis
+     list->rtas_batch.pending_rtas_work = false;
+ }
+ 
++static void d3d12_command_list_build_raytracing_opacity_micromap_array_ext(struct d3d12_command_list *list,
++        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *desc, UINT num_postbuild_info_descs,
++        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *postbuild_info_descs)
++{
++    struct vkd3d_view *micromap_view;
++    VkMicromapBuildInfoEXT *build_info;
++    VkMicromapUsageEXT *usage_infos;
++    uint32_t usage_info_count;
++    VkMicromapEXT micromap;
++
++    usage_info_count = desc->Inputs.pOpacityMicromapArrayDesc->NumOmmHistogramEntries;
++
++    if (!d3d12_command_list_allocate_omm_build_info_ext(list, usage_info_count,
++            &build_info, &usage_infos))
++        return;
++
++    if (!vkd3d_opacity_micromap_convert_inputs_ext(list->device, &desc->Inputs, build_info, usage_infos))
++    {
++        ERR("Failed to convert inputs.\n");
++        d3d12_command_list_discard_omm_build_info_ext(list, usage_info_count);
++        return;
++    }
++
++    if (!desc->DestAccelerationStructureData)
++    {
++        /* VkMicromapBuildInfoEXT::dstMicromap is not an optional handle, so unlike the KHR path
++         * there is nothing that could be submitted here. */
++        ERR("OMM array build without a destination address. Dropping call.\n");
++        d3d12_command_list_discard_omm_build_info_ext(list, usage_info_count);
++        return;
++    }
++
++    micromap_view = vkd3d_va_map_place_opacity_micromap_view_ext(&list->device->memory_allocator.va_map,
++            list->device, desc->DestAccelerationStructureData);
++    if (!micromap_view)
++    {
++        ERR("Failed to place destMicromap. Dropping call.\n");
++        d3d12_command_list_discard_omm_build_info_ext(list, usage_info_count);
++        return;
++    }
++
++    micromap = micromap_view->vk_micromap;
++    build_info->dstMicromap = micromap;
++
++    /* This is the only place D3D12 ever hands us the OMM histogram. Remember it on the view so that
++     * a later BLAS linkage referring to this VA can pass the same numbers to the driver, which is
++     * the only way VkAccelerationStructureTrianglesOpacityMicromapEXT can learn them. */
++    vkd3d_opacity_micromap_publish_usage_histogram_ext(micromap_view, desc->Inputs.pOpacityMicromapArrayDesc);
++
++    build_info->scratchData.deviceAddress = desc->ScratchAccelerationStructureData;
++
++#ifdef VKD3D_ENABLE_BREADCRUMBS
++    /* Immediately record the OMM build command here so that we don't have
++     * to create a deep copy of the entire D3D12 input description */
++    if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS))
++    {
++        d3d12_command_list_flush_rtas_batch(list);
++
++        VKD3D_BREADCRUMB_TAG("OMM build [Dest VA, Scratch VA]");
++        VKD3D_BREADCRUMB_AUX64(desc->DestAccelerationStructureData);
++        VKD3D_BREADCRUMB_AUX64(desc->ScratchAccelerationStructureData);
++        {
++            const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++            VkMicromapBuildSizesInfoEXT size_info;
++            uint32_t i;
++
++            memset(&size_info, 0, sizeof(size_info));
++            size_info.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_SIZES_INFO_EXT;
++
++            VK_CALL(vkGetMicromapBuildSizesEXT(list->device->vk_device,
++                    VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, build_info, &size_info));
++
++            VKD3D_BREADCRUMB_TAG("Build requirements [Size, Build Scratch, Discardable]");
++            VKD3D_BREADCRUMB_AUX64(size_info.micromapSize);
++            VKD3D_BREADCRUMB_AUX64(size_info.buildScratchSize);
++            VKD3D_BREADCRUMB_AUX32(size_info.discardable);
++
++            VKD3D_BREADCRUMB_TAG("Inputs [Flags, VA, Descs VA, Descs stride]");
++            VKD3D_BREADCRUMB_AUX32(desc->Inputs.Flags);
++            VKD3D_BREADCRUMB_AUX64(desc->Inputs.pOpacityMicromapArrayDesc->InputBuffer);
++            VKD3D_BREADCRUMB_AUX64(desc->Inputs.pOpacityMicromapArrayDesc->PerOmmDescs.StartAddress);
++            VKD3D_BREADCRUMB_AUX64(desc->Inputs.pOpacityMicromapArrayDesc->PerOmmDescs.StrideInBytes);
++
++            for (i = 0; i < desc->Inputs.pOpacityMicromapArrayDesc->NumOmmHistogramEntries; i++)
++            {
++                const D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY *histogram_entry =
++                        &desc->Inputs.pOpacityMicromapArrayDesc->pOmmHistogram[i];
++
++                VKD3D_BREADCRUMB_TAG("Histogram entry [Count, Subdivision Level, Format]");
++                VKD3D_BREADCRUMB_AUX32(histogram_entry->Count);
++                VKD3D_BREADCRUMB_AUX32(histogram_entry->SubdivisionLevel);
++                VKD3D_BREADCRUMB_AUX32(histogram_entry->Format);
++            }
++        }
++    }
++#endif
++
++    if (num_postbuild_info_descs)
++    {
++        uint32_t i;
++        vkd3d_array_reserve((void**)&list->rtas_batch.postbuild_infos, &list->rtas_batch.postbuild_infos_size,
++                            list->rtas_batch.postbuild_infos_count + num_postbuild_info_descs,
++                            sizeof(*list->rtas_batch.postbuild_infos));
++
++        for (i = 0; i < num_postbuild_info_descs; i++)
++        {
++            struct vk_acceleration_structure_postbuild_info *info =
++                    &list->rtas_batch.postbuild_infos[list->rtas_batch.postbuild_infos_count++];
++            info->desc = postbuild_info_descs[i];
++            info->rtas_vk.micromap_ext = micromap;
++            info->rtas_va = 0;
++            info->is_omm = true;
++        }
++    }
++
++    VKD3D_BREADCRUMB_COMMAND(BUILD_OMM);
++}
++
+ static void d3d12_command_list_build_raytracing_opacity_micromap_array(struct d3d12_command_list *list,
+         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *desc, UINT num_postbuild_info_descs,
+         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *postbuild_info_descs)
+@@ -21602,7 +21856,7 @@ static void d3d12_command_list_build_raytracing_opacity_micromap_array(struct d3
+             struct vk_acceleration_structure_postbuild_info *info =
+                     &list->rtas_batch.postbuild_infos[list->rtas_batch.postbuild_infos_count++];
+             info->desc = postbuild_info_descs[i];
+-            info->rtas_vk = micromap;
++            info->rtas_vk.rtas = micromap;
+             info->rtas_va = 0;
+             info->is_omm = true;
+         }
+@@ -21615,8 +21869,8 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
+         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *desc, UINT num_postbuild_info_descs,
+         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *postbuild_info_descs)
+ {
+-    VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos;
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    union vkd3d_omm_triangles_info omm_triangles_infos;
+     VkAccelerationStructureBuildGeometryInfoKHR *build_info;
+     VkAccelerationStructureBuildRangeInfoKHR *range_infos;
+     VkAccelerationStructureGeometryKHR *geometry_infos;
+@@ -21640,14 +21894,20 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
+         return;
+ 
+     if (!vkd3d_acceleration_structure_convert_inputs(list->device, &desc->Inputs,
+-            build_info, geometry_infos, omm_triangles_infos, range_infos, primitive_counts))
++            build_info, geometry_infos, &omm_triangles_infos, range_infos, primitive_counts))
+     {
+         ERR("Failed to convert inputs.\n");
+         return;
+     }
+ 
+-    if (!vkd3d_acceleration_structure_resolve_omm_va_maps(list->device, &desc->Inputs,
+-            omm_triangles_infos))
++    if (d3d12_device_uses_ext_opacity_micromap(list->device))
++    {
++        if (!vkd3d_acceleration_structure_resolve_omm_va_maps_ext(list->device, &desc->Inputs,
++                omm_triangles_infos.ext))
++            return;
++    }
++    else if (!vkd3d_acceleration_structure_resolve_omm_va_maps(list->device, &desc->Inputs,
++            omm_triangles_infos.khr))
+         return;
+ 
+     rtas_kind = (desc->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) ?
+@@ -21794,7 +22054,7 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
+             struct vk_acceleration_structure_postbuild_info *info =
+                     &list->rtas_batch.postbuild_infos[list->rtas_batch.postbuild_infos_count++];
+             info->desc = postbuild_info_descs[i];
+-            info->rtas_vk = build_info->dstAccelerationStructure;
++            info->rtas_vk.rtas = build_info->dstAccelerationStructure;
+             info->rtas_va = desc->DestAccelerationStructureData;
+             info->is_omm = false;
+             info->rtas_kind = rtas_kind;
+@@ -21841,7 +22101,11 @@ static void STDMETHODCALLTYPE d3d12_command_list_BuildRaytracingAccelerationStru
+     }
+     else
+     {
+-        assume_hazard = rtas_batch->build_info_count && rtas_batch->build_type != desc->Inputs.Type;
++        /* On the EXT backend an OMM array build does not occupy a build_infos slot, so the OMM to
++         * BLAS transition would otherwise go unnoticed and the dependent BLAS would land in the same
++         * batch. The two counters move in lockstep on KHR, so this is equivalent there. */
++        assume_hazard = (rtas_batch->build_info_count || rtas_batch->omm_build_info_count) &&
++                rtas_batch->build_type != desc->Inputs.Type;
+     }
+ 
+     if (assume_hazard)
+@@ -21854,8 +22118,14 @@ static void STDMETHODCALLTYPE d3d12_command_list_BuildRaytracingAccelerationStru
+     rtas_batch->build_flags = desc->Inputs.Flags;
+ 
+     if (rtas_batch->build_type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY)
+-        d3d12_command_list_build_raytracing_opacity_micromap_array(list,
+-                desc, num_postbuild_info_descs, postbuild_info_descs);
++    {
++        if (d3d12_device_uses_ext_opacity_micromap(list->device))
++            d3d12_command_list_build_raytracing_opacity_micromap_array_ext(list,
++                    desc, num_postbuild_info_descs, postbuild_info_descs);
++        else
++            d3d12_command_list_build_raytracing_opacity_micromap_array(list,
++                    desc, num_postbuild_info_descs, postbuild_info_descs);
++    }
+     else
+         d3d12_command_list_build_raytracing_blas_and_tlas(list,
+                 desc, num_postbuild_info_descs, postbuild_info_descs);
+@@ -21900,7 +22170,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_EmitRaytracingAccelerationStruc
+         info->desc = *desc;
+         info->desc.DestBuffer += i * stride;
+         info->rtas_va = src_data[i];
+-        info->rtas_vk = VK_NULL_HANDLE;
++        info->rtas_vk.rtas = VK_NULL_HANDLE;
+         info->is_omm = false;
+     }
+ }
+@@ -21940,6 +22210,28 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyRaytracingAccelerationStruc
+     /* We have not observed broken copy -> trace sync in the wild so far.
+      * Don't consider this pending RTAS work until we have evidence of real-world breakage. */
+ 
++    if (d3d12_device_uses_ext_opacity_micromap(list->device))
++    {
++        /* On the EXT backend a micromap and an acceleration structure are different object types, so
++         * the source object has to be identified before picking the copy command. try_read never
++         * creates a view, so this only hits when a micromap really lives at this VA. The view, not
++         * just the handle, is needed so that the destination can inherit the usage histogram. */
++        const struct vkd3d_view *src_omm_view;
++
++        src_omm_view = vkd3d_va_map_try_read_opacity_micromap_view_ext(
++                &list->device->memory_allocator.va_map, list->device, src_data);
++
++        if (src_omm_view)
++        {
++            vkd3d_opacity_micromap_copy_ext(list, dst_data, src_omm_view, mode);
++            VKD3D_BREADCRUMB_AUX64(dst_data);
++            VKD3D_BREADCRUMB_AUX64(src_data);
++            VKD3D_BREADCRUMB_AUX32(mode);
++            VKD3D_BREADCRUMB_COMMAND(COPY_OMM);
++            return;
++        }
++    }
++
+     vkd3d_va_map_try_read_rtas(&list->device->memory_allocator.va_map,
+             list->device, src_data, &src_as, &rtas_kind);
+ 
+@@ -22382,9 +22674,21 @@ static VkPipelineStageFlags2 vk_stage_flags_from_d3d12_barrier(struct d3d12_comm
+     }
+ 
+     if (sync & D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE)
++    {
+         stages |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_COPY_BIT_KHR;
++        /* D3D12 does not distinguish an OMM array from an acceleration structure here, and on the
++         * EXT backend vkCmdCopyMicromapEXT executes in MICROMAP_BUILD; VK_EXT_opacity_micromap has
++         * no separate micromap copy stage. */
++        if (d3d12_device_uses_ext_opacity_micromap(list->device))
++            stages |= VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT;
++    }
+     if (sync & D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE)
++    {
+         stages |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
++        /* Same sync bit covers vkCmdBuildMicromapsEXT on the EXT backend. */
++        if (d3d12_device_uses_ext_opacity_micromap(list->device))
++            stages |= VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT;
++    }
+     if (sync & D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO)
+     {
+         /* Somewhat awkward, but in legacy barriers we have to consider that UNORDERED_ACCESS is used to handle
+@@ -22459,9 +22763,19 @@ static VkAccessFlags2 vk_access_flags_from_d3d12_barrier(struct d3d12_command_li
+     if (access & D3D12_BARRIER_ACCESS_RESOLVE_SOURCE)
+         vk_access |= VK_ACCESS_2_TRANSFER_READ_BIT;
+     if (access & D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ)
++    {
+         vk_access |= VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
++        /* An OMM array uses the same D3D12 access bits as an acceleration structure, but on the EXT
++         * backend VkMicromapEXT accesses are not covered by the acceleration structure bits. */
++        if (d3d12_device_uses_ext_opacity_micromap(list->device))
++            vk_access |= VK_ACCESS_2_MICROMAP_READ_BIT_EXT;
++    }
+     if (access & D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE)
++    {
+         vk_access |= VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
++        if (d3d12_device_uses_ext_opacity_micromap(list->device))
++            vk_access |= VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT;
++    }
+     if (access & D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE)
+         vk_access |= VK_ACCESS_2_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR;
+ 
+@@ -22580,6 +22894,18 @@ static VkPipelineStageFlags2 vk_sanitize_stage_flags_for_access(struct d3d12_com
+     HANDLE_ACCESS(VK_ACCESS_2_SHADER_BINDING_TABLE_READ_BIT_KHR,
+             VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR);
+ 
++    /* Only ever set on the VK_EXT_opacity_micromap backend, but harmless to handle unconditionally:
++     * these bits cannot be set otherwise, so this is a no-op on KHR. Without them a barrier carrying
++     * MICROMAP access would fall into the FIXME below and lose its stage.
++     * MICROMAP_READ is additionally legal in ACCELERATION_STRUCTURE_BUILD, which is where a BLAS
++     * build consumes the array; MICROMAP_WRITE is only legal in MICROMAP_BUILD. */
++    HANDLE_ACCESS(VK_ACCESS_2_MICROMAP_READ_BIT_EXT,
++            VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT |
++            VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
++
++    HANDLE_ACCESS(VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT,
++            VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT);
++
+     if (access)
+         FIXME("Unhandled access flags %#"PRIx64".\n", access);
+ 
+diff --git a/libs/vkd3d/command_list_vkd3d_ext.c b/libs/vkd3d/command_list_vkd3d_ext.c
+--- a/libs/vkd3d/command_list_vkd3d_ext.c
++++ b/libs/vkd3d/command_list_vkd3d_ext.c
+@@ -132,6 +132,14 @@ static BOOL STDMETHODCALLTYPE d3d12_command_list_vkd3d_ext_VerifyOpacityMicromap
+ 
+     TRACE("iface %p, opacity_micromap_array %#"PRIx64".\n", iface, opacity_micromap_array);
+ 
++    /* On the EXT backend the distinction is inherent in the object type, so this is exact rather
++     * than the "non-TLAS, so probably an OMM array" approximation the KHR path has to make. */
++    if (d3d12_device_uses_ext_opacity_micromap(list->device))
++    {
++        return vkd3d_va_map_try_read_opacity_micromap_ext(&list->device->memory_allocator.va_map,
++                list->device, opacity_micromap_array) != VK_NULL_HANDLE;
++    }
++
+     vkd3d_va_map_try_read_rtas(&list->device->memory_allocator.va_map, list->device,
+                 opacity_micromap_array, &as, &rtas_kind);
+     return as != VK_NULL_HANDLE && (rtas_kind == VKD3D_RTAS_KIND_NON_TLAS || rtas_kind == VKD3D_RTAS_KIND_MUTATED);
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -96,6 +96,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+     VK_EXTENSION(EXT_PRESENT_TIMING, EXT_present_timing),
+     VK_EXTENSION(KHR_DEVICE_ADDRESS_COMMANDS, KHR_device_address_commands),
+     VK_EXTENSION_DISABLE_COND(KHR_OPACITY_MICROMAP, KHR_opacity_micromap, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
++    VK_EXTENSION_DISABLE_COND(EXT_OPACITY_MICROMAP, EXT_opacity_micromap, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
+ #ifdef _WIN32
+     VK_EXTENSION(KHR_EXTERNAL_MEMORY_WIN32, KHR_external_memory_win32),
+     VK_EXTENSION(KHR_EXTERNAL_SEMAPHORE_WIN32, KHR_external_semaphore_win32),
+@@ -2134,6 +2135,36 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+ 
+     memset(info, 0, sizeof(*info));
+ 
++    /* KHR is the first choice backend, so drop EXT whenever KHR is actually usable, and do it here
++     * so that such a device never sees VK_EXT_opacity_micromap in the enabled extension list nor its
++     * feature struct in the pNext chain. Usability is a property of the feature bit, not of the
++     * extension being advertised, but the feature bits only exist after vkGetPhysicalDeviceFeatures2
++     * and this decision has to be made before the pNext chain for that very call is assembled.
++     * Hence a separate throwaway query on a local chain: it never touches info->features2, so the
++     * chain handed to vkCreateDevice is unaffected, and on a device that does not expose EXT at all
++     * - the ordinary KHR case - it does not run. */
++    if (vulkan_info->KHR_opacity_micromap && vulkan_info->EXT_opacity_micromap)
++    {
++        VkPhysicalDeviceOpacityMicromapFeaturesKHR opacity_micromap_probe;
++        VkPhysicalDeviceFeatures2 features_probe;
++
++        memset(&opacity_micromap_probe, 0, sizeof(opacity_micromap_probe));
++        opacity_micromap_probe.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_KHR;
++
++        memset(&features_probe, 0, sizeof(features_probe));
++        features_probe.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
++        features_probe.pNext = &opacity_micromap_probe;
++
++        VK_CALL(vkGetPhysicalDeviceFeatures2(device->vk_physical_device, &features_probe));
++
++        /* Same truthiness test as the assignment to using_khr_opacity_micromap below, so the probe
++         * and the real query can never disagree about what "KHR is usable" means. */
++        if (opacity_micromap_probe.micromap)
++            vulkan_info->EXT_opacity_micromap = false;
++        else
++            WARN("VK_KHR_opacity_micromap is exposed without the micromap feature, using VK_EXT_opacity_micromap.\n");
++    }
++
+     info->features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+     info->properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+ 
+@@ -2624,6 +2655,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+         vk_prepend_struct(&info->features2, &info->opacity_micromap_features);
+     }
+ 
++    if (vulkan_info->EXT_opacity_micromap)
++    {
++        info->opacity_micromap_features_ext.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
++        vk_prepend_struct(&info->features2, &info->opacity_micromap_features_ext);
++    }
++
+     if (vulkan_info->KHR_index_type_uint8)
+     {
+         info->index_type_uint8_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR;
+@@ -2712,7 +2749,14 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+     VK_CALL(vkGetPhysicalDeviceFeatures2(device->vk_physical_device, &info->features2));
+     VK_CALL(vkGetPhysicalDeviceProperties2(device->vk_physical_device, &info->properties2));
+ 
+-    info->supports_opacity_micromap = info->opacity_micromap_features.micromap;
++    /* Prefer KHR over EXT, and only ever enable one of them. The EXT feature struct is only in the
++     * chain when the probe at the top of this function decided KHR was unusable, so the reset below
++     * is defensive only. */
++    info->using_khr_opacity_micromap = info->opacity_micromap_features.micromap;
++    if (info->using_khr_opacity_micromap)
++        info->opacity_micromap_features_ext.micromap = VK_FALSE;
++    info->supports_opacity_micromap = info->using_khr_opacity_micromap ||
++            info->opacity_micromap_features_ext.micromap;
+ 
+     /* if nonzero, this is a layered implementation */
+     if (real_driver_props.driverID)
+@@ -3129,6 +3173,11 @@ static void vkd3d_trace_physical_device_features(const struct vkd3d_physical_dev
+ 
+     TRACE("  VkPhysicalDeviceOpacityMicromapFeaturesKHR:\n");
+     TRACE("    micromap: %#x\n", info->opacity_micromap_features.micromap);
++
++    TRACE("  VkPhysicalDeviceOpacityMicromapFeaturesEXT:\n");
++    TRACE("    micromap: %#x\n", info->opacity_micromap_features_ext.micromap);
++    TRACE("    micromapCaptureReplay: %#x\n", info->opacity_micromap_features_ext.micromapCaptureReplay);
++    TRACE("    micromapHostCommands: %#x\n", info->opacity_micromap_features_ext.micromapHostCommands);
+ }
+ 
+ static HRESULT vkd3d_init_device_extensions(struct d3d12_device *device,
+@@ -4616,6 +4665,19 @@ static HRESULT d3d12_device_create_query_pool(struct d3d12_device *device, uint3
+             pool_info.queryCount = 128;
+             break;
+ 
++        case VKD3D_QUERY_TYPE_INDEX_OMM_COMPACTED_SIZE:
++            pool_info.queryType = VK_QUERY_TYPE_MICROMAP_COMPACTED_SIZE_EXT;
++            pool_info.queryCount = 128;
++            break;
++
++        case VKD3D_QUERY_TYPE_INDEX_OMM_SERIALIZE_SIZE:
++            /* Currently unreachable: vkd3d_opacity_micromap_write_postbuild_info_ext reports a zero
++             * serialization size because the matching SERIALIZE copy is not implemented. Kept so the
++             * pool is already in place when it is. */
++            pool_info.queryType = VK_QUERY_TYPE_MICROMAP_SERIALIZATION_SIZE_EXT;
++            pool_info.queryCount = 128;
++            break;
++
+         default:
+             ERR("Unhandled query type %u.\n", type_index);
+             return E_INVALIDARG;
+@@ -8842,6 +8904,50 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateStateObject(d3d12_device_ifa
+     }
+ }
+ 
++static void d3d12_device_get_raytracing_opacity_micromap_array_prebuild_info_ext(struct d3d12_device *device,
++        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
++        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO *info)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VkMicromapUsageEXT usages_stack[VKD3D_BUILD_INFO_STACK_COUNT];
++    VkMicromapBuildSizesInfoEXT size_info;
++    VkMicromapBuildInfoEXT build_info;
++    VkMicromapUsageEXT *usages;
++    uint32_t usages_count;
++
++    usages_count = desc->pOpacityMicromapArrayDesc->NumOmmHistogramEntries;
++
++    if (usages_count > VKD3D_BUILD_INFO_STACK_COUNT)
++        usages = vkd3d_malloc(usages_count * sizeof(*usages));
++    else
++        usages = usages_stack;
++
++    if (!vkd3d_opacity_micromap_convert_inputs_ext(device, desc, &build_info, usages))
++    {
++        ERR("Failed to convert inputs.\n");
++        memset(info, 0, sizeof(*info));
++        goto cleanup;
++    }
++
++    memset(&size_info, 0, sizeof(size_info));
++    size_info.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_SIZES_INFO_EXT;
++
++    VK_CALL(vkGetMicromapBuildSizesEXT(device->vk_device,
++            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info, &size_info));
++
++    info->ResultDataMaxSizeInBytes = size_info.micromapSize;
++    info->ScratchDataSizeInBytes = size_info.buildScratchSize;
++    info->UpdateScratchDataSizeInBytes = 0;
++
++    TRACE("ResultDataMaxSizeInBytes: %"PRIu64".\n", (uint64_t)info->ResultDataMaxSizeInBytes);
++    TRACE("ScratchDataSizeInBytes: %"PRIu64".\n", (uint64_t)info->ScratchDataSizeInBytes);
++
++cleanup:
++
++    if (usages_count > VKD3D_BUILD_INFO_STACK_COUNT)
++        vkd3d_free(usages);
++}
++
+ static void d3d12_device_get_raytracing_opacity_micromap_array_prebuild_info(struct d3d12_device *device,
+         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
+         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO *info)
+@@ -8862,6 +8968,12 @@ static void d3d12_device_get_raytracing_opacity_micromap_array_prebuild_info(str
+         return;
+     }
+ 
++    if (d3d12_device_uses_ext_opacity_micromap(device))
++    {
++        d3d12_device_get_raytracing_opacity_micromap_array_prebuild_info_ext(device, desc, info);
++        return;
++    }
++
+     usages_count = desc->pOpacityMicromapArrayDesc->NumOmmHistogramEntries;
+ 
+     if (usages_count > VKD3D_BUILD_INFO_STACK_COUNT)
+@@ -8902,9 +9014,15 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
+ {
+     struct d3d12_device *device = impl_from_ID3D12Device(iface);
+ 
+-    VkAccelerationStructureTrianglesOpacityMicromapKHR omm_triangles_infos_stack[VKD3D_BUILD_INFO_STACK_COUNT];
++    /* The two backends disagree on the element size of the linkage array, so the stack storage has
++     * to cover the larger of the two. */
++    union
++    {
++        VkAccelerationStructureTrianglesOpacityMicromapKHR khr[VKD3D_BUILD_INFO_STACK_COUNT];
++        VkAccelerationStructureTrianglesOpacityMicromapEXT ext[VKD3D_BUILD_INFO_STACK_COUNT];
++    } omm_triangles_infos_stack;
+     VkAccelerationStructureGeometryKHR geometries_stack[VKD3D_BUILD_INFO_STACK_COUNT];
+-    VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos;
++    union vkd3d_omm_triangles_info omm_triangles_infos;
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     uint32_t primitive_counts_stack[VKD3D_BUILD_INFO_STACK_COUNT];
+     VkAccelerationStructureBuildGeometryInfoKHR build_info;
+@@ -8931,17 +9049,25 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
+     geometry_count = vkd3d_acceleration_structure_get_geometry_count(desc);
+     primitive_counts = primitive_counts_stack;
+     geometries = geometries_stack;
+-    omm_triangles_infos = omm_triangles_infos_stack;
++
++    if (d3d12_device_uses_ext_opacity_micromap(device))
++        omm_triangles_infos.ext = omm_triangles_infos_stack.ext;
++    else
++        omm_triangles_infos.khr = omm_triangles_infos_stack.khr;
+ 
+     if (geometry_count > VKD3D_BUILD_INFO_STACK_COUNT)
+     {
+         primitive_counts = vkd3d_malloc(geometry_count * sizeof(*primitive_counts));
+         geometries = vkd3d_malloc(geometry_count * sizeof(*geometries));
+-        omm_triangles_infos = vkd3d_malloc(geometry_count * sizeof(*omm_triangles_infos));
++
++        if (d3d12_device_uses_ext_opacity_micromap(device))
++            omm_triangles_infos.ext = vkd3d_malloc(geometry_count * sizeof(*omm_triangles_infos.ext));
++        else
++            omm_triangles_infos.khr = vkd3d_malloc(geometry_count * sizeof(*omm_triangles_infos.khr));
+     }
+ 
+     if (!vkd3d_acceleration_structure_convert_inputs(device,
+-            desc, &build_info, geometries, omm_triangles_infos, NULL, primitive_counts))
++            desc, &build_info, geometries, &omm_triangles_infos, NULL, primitive_counts))
+     {
+         ERR("Failed to convert inputs.\n");
+         memset(info, 0, sizeof(*info));
+@@ -8990,7 +9116,7 @@ cleanup:
+     {
+         vkd3d_free(primitive_counts);
+         vkd3d_free(geometries);
+-        vkd3d_free(omm_triangles_infos);
++        vkd3d_free(omm_triangles_infos.khr);
+     }
+ }
+ 
+diff --git a/libs/vkd3d/opacity_micromap.c b/libs/vkd3d/opacity_micromap.c
+--- a/libs/vkd3d/opacity_micromap.c
++++ b/libs/vkd3d/opacity_micromap.c
+@@ -45,6 +45,28 @@ static VkBuildAccelerationStructureFlagsKHR d3d12_build_flags_to_vk(
+     return vk_flags;
+ }
+ 
++static VkBuildMicromapFlagsEXT d3d12_build_flags_to_vk_ext(
++        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS flags)
++{
++    VkBuildMicromapFlagsEXT vk_flags = 0;
++
++    /* VkBuildMicromapFlagBitsEXT and VkBuildAccelerationStructureFlagBitsKHR do not agree on bit
++     * values (EXT: TRACE=0x1, BUILD=0x2, COMPACTION=0x4), and both are plain VkFlags, so feeding an
++     * acceleration structure mask in here would silently build with the wrong preferences. */
++    if (flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION)
++        vk_flags |= VK_BUILD_MICROMAP_ALLOW_COMPACTION_BIT_EXT;
++    if (flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE)
++        vk_flags |= VK_BUILD_MICROMAP_PREFER_FAST_TRACE_BIT_EXT;
++    if (flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)
++        vk_flags |= VK_BUILD_MICROMAP_PREFER_FAST_BUILD_BIT_EXT;
++
++    /* MINIMIZE_MEMORY and ALLOW_UPDATE have no equivalent, VkBuildMicromapModeEXT only has BUILD. */
++    if (flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
++        FIXME_ONCE("ALLOW_UPDATE on opacity micromap build is unsupported by Vulkan; ignoring.\n");
++
++    return vk_flags;
++}
++
+ static VkOpacityMicromapFormatKHR d3d12_format_to_vk(
+         D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT format)
+ {
+@@ -142,6 +164,232 @@ bool vkd3d_opacity_micromap_convert_inputs(const struct d3d12_device *device,
+     return true;
+ }
+ 
++/* VkMicromapUsageEXT and VkMicromapUsageKHR are distinct declarations even though they have the
++ * same layout, so the two backends cannot share one array. */
++static uint32_t vkd3d_opacity_micromap_convert_inputs_usages_ext(
++        const D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC *desc,
++        VkMicromapUsageEXT *usages)
++{
++    const D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY *histogram_entry;
++    VkMicromapUsageEXT *usage;
++    unsigned int i;
++
++    for (i = 0; i < desc->NumOmmHistogramEntries; i++)
++    {
++        RT_TRACE(" Histogram entry %u:\n", i);
++
++        histogram_entry = &desc->pOmmHistogram[i];
++        usage = &usages[i];
++
++        usage->count = histogram_entry->Count;
++        usage->subdivisionLevel = histogram_entry->SubdivisionLevel;
++        usage->format = d3d12_format_to_vk(histogram_entry->Format);
++
++        RT_TRACE("  Count: %u\n", histogram_entry->Count);
++        RT_TRACE("  Subdivision level: %u\n", histogram_entry->SubdivisionLevel);
++        RT_TRACE("  Format: %s\n", debug_omm_format(histogram_entry->Format));
++    }
++    return desc->NumOmmHistogramEntries;
++}
++
++bool vkd3d_opacity_micromap_convert_inputs_ext(const struct d3d12_device *device,
++        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *inputs,
++        VkMicromapBuildInfoEXT *build_info,
++        VkMicromapUsageEXT *usages)
++{
++    const D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC *desc = inputs->pOpacityMicromapArrayDesc;
++
++    RT_TRACE("Converting inputs.\n");
++    RT_TRACE("=====================\n");
++
++    /* Unlike the KHR path there is no geometry and no pNext link; VkMicromapBuildInfoEXT is a flat,
++     * top level description, and pNext must be NULL. */
++    memset(build_info, 0, sizeof(*build_info));
++    build_info->sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_INFO_EXT;
++    build_info->type = VK_MICROMAP_TYPE_OPACITY_MICROMAP_EXT;
++    build_info->flags = d3d12_build_flags_to_vk_ext(inputs->Flags);
++    build_info->mode = VK_BUILD_MICROMAP_MODE_BUILD_EXT;
++    build_info->usageCountsCount = vkd3d_opacity_micromap_convert_inputs_usages_ext(desc, usages);
++    build_info->pUsageCounts = usages;
++    build_info->data.deviceAddress = desc->InputBuffer;
++    build_info->triangleArray.deviceAddress = desc->PerOmmDescs.StartAddress;
++    build_info->triangleArrayStride = desc->PerOmmDescs.StrideInBytes;
++
++    RT_TRACE(" IBO VA: %"PRIx64"\n", desc->InputBuffer);
++    RT_TRACE(" Triangles VA: %"PRIx64"\n", desc->PerOmmDescs.StartAddress);
++    RT_TRACE(" Triangles stride: %"PRIu64" bytes\n", desc->PerOmmDescs.StrideInBytes);
++
++    RT_TRACE("=====================\n");
++    return true;
++}
++
++/* The list is push only, so an application rebuilding the array at the same VA with a genuinely
++ * different histogram would grow it without bound for the lifetime of the allocation. Past this
++ * many revisions we stop tracking the VA and fall back to the upstream EXT behaviour,
++ * usageCountsCount = 0, which the lookup already implements for count == 0. A build which
++ * legitimately publishes an empty histogram degrades the VA in the same way; that is the same legal
++ * fallback, not a new failure mode. */
++#define VKD3D_OMM_USAGE_HISTOGRAM_MAX_NODES_EXT 256u
++
++/* Takes ownership of node, which must be fully populated; it is published as is or freed. */
++static void vkd3d_opacity_micromap_publish_usage_histogram_node_ext(struct vkd3d_view *view,
++        struct vkd3d_omm_usage_histogram_ext *node)
++{
++    const struct vkd3d_omm_usage_histogram_ext *iter;
++    struct vkd3d_omm_usage_histogram_ext *previous;
++    struct vkd3d_omm_usage_histogram_ext *head;
++    size_t usages_size;
++    unsigned int depth;
++
++    usages_size = node->count * sizeof(*node->usages);
++
++    head = vkd3d_atomic_ptr_load_explicit(&view->info.buffer.omm_histogram_ext, vkd3d_memory_order_acquire);
++
++    for (;;)
++    {
++        /* Rebuilding the same OMM array every frame is the dominant case; deduplicating against the
++         * current head keeps that from leaking a node per build. Nodes are immutable, so this needs
++         * no lock. */
++        if (head && head->count == node->count && !memcmp(head->usages, node->usages, usages_size))
++        {
++            vkd3d_free(node);
++            return;
++        }
++
++        /* Already degraded to count = 0. Nothing left to publish, and pushing again would restart
++         * the growth this cap exists to stop. */
++        if (head && !head->count)
++        {
++            vkd3d_free(node);
++            return;
++        }
++
++        for (depth = 0, iter = head; iter; iter = iter->next)
++            depth++;
++
++        if (depth >= VKD3D_OMM_USAGE_HISTOGRAM_MAX_NODES_EXT)
++        {
++            /* Must fall through to the push below. Restarting the loop here would re-run this same
++             * test against an unchanged head and spin forever. */
++            WARN("OMM array view %p exceeded %u usage histogram revisions, falling back to "
++                    "usageCountsCount = 0 for this VA.\n", view, VKD3D_OMM_USAGE_HISTOGRAM_MAX_NODES_EXT);
++            node->count = 0;
++            usages_size = 0;
++        }
++
++        node->next = head;
++        previous = vkd3d_atomic_ptr_compare_exchange(&view->info.buffer.omm_histogram_ext, head, node,
++                vkd3d_memory_order_release, vkd3d_memory_order_acquire);
++        if (previous == head)
++            break;
++        head = previous;
++    }
++
++    if (head)
++    {
++        /* The old node stays linked forever on purpose. A command list recorded earlier may already
++         * point pUsageCounts at it, and it is only unreachable once the allocation dies. */
++        WARN("OMM array rebuilt with a different usage histogram, %u entries replacing %u.\n",
++                node->count, head->count);
++    }
++}
++
++void vkd3d_opacity_micromap_publish_usage_histogram_ext(struct vkd3d_view *view,
++        const D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC *desc)
++{
++    struct vkd3d_omm_usage_histogram_ext *node;
++
++    if (!(node = vkd3d_malloc(sizeof(*node) + desc->NumOmmHistogramEntries * sizeof(*node->usages))))
++    {
++        ERR("Failed to allocate OMM usage histogram.\n");
++        return;
++    }
++
++    /* Reuses the exact conversion the build itself uses, so the linkage cannot disagree with the
++     * array it points at. */
++    node->next = NULL;
++    node->count = vkd3d_opacity_micromap_convert_inputs_usages_ext(desc, node->usages);
++
++    vkd3d_opacity_micromap_publish_usage_histogram_node_ext(view, node);
++}
++
++/* CLONE and COMPACT change the size in bytes, not the set of micromaps, so the destination inherits
++ * the source histogram. Without this a cloned array silently reverts to usageCountsCount = 0. */
++static void vkd3d_opacity_micromap_inherit_usage_histogram_ext(struct vkd3d_view *dst_view,
++        const struct vkd3d_view *src_view)
++{
++    const struct vkd3d_omm_usage_histogram_ext *src_node;
++    struct vkd3d_omm_usage_histogram_ext *node;
++    size_t usages_size;
++
++    src_node = vkd3d_atomic_ptr_load_explicit(&src_view->info.buffer.omm_histogram_ext,
++            vkd3d_memory_order_acquire);
++    if (!src_node)
++        return;
++
++    usages_size = src_node->count * sizeof(*src_node->usages);
++
++    if (!(node = vkd3d_malloc(sizeof(*node) + usages_size)))
++    {
++        ERR("Failed to allocate OMM usage histogram.\n");
++        return;
++    }
++
++    node->next = NULL;
++    node->count = src_node->count;
++    memcpy(node->usages, src_node->usages, usages_size);
++
++    vkd3d_opacity_micromap_publish_usage_histogram_node_ext(dst_view, node);
++}
++
++uint32_t vkd3d_opacity_micromap_lookup_usage_histogram_ext(struct d3d12_device *device,
++        D3D12_GPU_VIRTUAL_ADDRESS va, const VkMicromapUsageEXT **usages)
++{
++    const struct vkd3d_omm_usage_histogram_ext *node;
++    const struct vkd3d_view *view;
++
++    *usages = NULL;
++
++    /* Default behaviour is usageCountsCount = 0, exactly like the upstream EXT backend. The
++     * republication below cannot be enabled by default because it is not stable in time: the
++     * histogram node only appears when the OMM array build is recorded, so a prebuild sizing query
++     * issued before that build sees 0 while the build itself would see N, and
++     * vkCmdBuildAccelerationStructuresKHR requires the build info to match the one the sizes were
++     * queried with. */
++    if (!VKD3D_CONFIG_FLAG_IS_SET(OMM_EXT_LINKAGE_USAGE_COUNTS))
++        return 0;
++
++    /* The geometry does not reference an OMM array at all. Zero is the complete answer here, not a
++     * fallback; the KHR linkage struct cannot express anything else either. */
++    if (!va)
++        return 0;
++
++    /* try_read never creates a view, but that only makes the read itself side effect free; it does
++     * not make two reads of the same VA agree over time. See the flag comment above. */
++    view = vkd3d_va_map_try_read_opacity_micromap_view_ext(&device->memory_allocator.va_map, device, va);
++    node = view ? vkd3d_atomic_ptr_load_explicit(&view->info.buffer.omm_histogram_ext,
++            vkd3d_memory_order_acquire) : NULL;
++
++    if (!node)
++    {
++        /* Reachable when the array at this VA has not been built on this device yet, when it
++         * appeared through DESERIALIZE (unimplemented on this backend), or when the BLAS is recorded
++         * in parallel with the array build in another command list. Falls back to what the upstream
++         * EXT backend did for three years: usageCountsCount = 0. Legal per
++         * VUID-VkAccelerationStructureTrianglesOpacityMicromapEXT-pUsageCounts-07335, and still
++         * strictly more information than the KHR linkage struct is able to carry. Loud, not silent. */
++        FIXME_ONCE("No OMM usage histogram recorded for VA #%"PRIx64". Sending usageCountsCount = 0 "
++                "(upstream EXT behaviour). BLAS will be sized without micromap usage information.\n", va);
++        return 0;
++    }
++
++    if (!node->count)
++        return 0;
++
++    *usages = node->usages;
++    return node->count;
++}
++
+ static void vkd3d_opacity_micromap_end_barrier(struct d3d12_command_list *list)
+ {
+     /* We resolve the query in TRANSFER, but DXR expects UNORDERED_ACCESS. */
+@@ -198,6 +446,117 @@ void vkd3d_opacity_micromap_emit_immediate_postbuild_info(
+     vkd3d_opacity_micromap_end_barrier(list);
+ }
+ 
++/* Deliberately not folded into vkd3d_acceleration_structure_write_postbuild_info, which is shared
++ * with the acceleration structure path. */
++static void vkd3d_opacity_micromap_write_postbuild_info_ext(
++        struct d3d12_command_list *list,
++        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc,
++        VkMicromapEXT vk_micromap)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    const struct vkd3d_unique_resource *resource;
++    const VkDeviceSize stride = sizeof(uint64_t);
++    VkQueryPool vk_query_pool;
++    VkQueryType vk_query_type;
++    uint32_t vk_query_index;
++    uint32_t type_index;
++    VkBuffer vk_buffer;
++    uint32_t offset;
++
++    resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, desc->DestBuffer);
++    if (!resource)
++    {
++        ERR("Invalid resource.\n");
++        return;
++    }
++
++    vk_buffer = resource->vk_buffer;
++    offset = desc->DestBuffer - resource->va;
++
++    if (desc->InfoType == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE)
++    {
++        vk_query_type = VK_QUERY_TYPE_MICROMAP_COMPACTED_SIZE_EXT;
++        type_index = VKD3D_QUERY_TYPE_INDEX_OMM_COMPACTED_SIZE;
++    }
++    else if (desc->InfoType == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION)
++    {
++        /* VK_QUERY_TYPE_MICROMAP_SERIALIZATION_SIZE_EXT would answer this truthfully, but
++         * vkd3d_opacity_micromap_copy_ext cannot execute the SERIALIZE copy the application would
++         * issue next, so handing out a plausible size only buys a buffer full of garbage.
++         * FIXME: implement micromap serialization, then restore the real query here.
++         * Both halves are missing: vkCmdCopyMicromapToMemoryEXT / vkCmdCopyMemoryToMicromapEXT are
++         * not loaded (vulkan_procs.h), and DESERIALIZE cannot even be routed to the micromap path,
++         * because its source is plain memory and nothing at record time distinguishes a serialized
++         * micromap from a serialized acceleration structure. */
++        FIXME_ONCE("Opacity micromap serialization is not implemented on the VK_EXT_opacity_micromap "
++                "fallback, reporting SerializedSizeInBytes = 0.\n");
++        VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, vk_buffer, offset,
++                2 * sizeof(uint64_t), 0));
++        return;
++    }
++    else
++    {
++        /* VK_EXT_opacity_micromap has no equivalent of VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR,
++         * so CURRENT_SIZE is a known gap of this fallback. */
++        FIXME_ONCE("Unsupported InfoType %u on the VK_EXT_opacity_micromap fallback.\n", desc->InfoType);
++        VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, vk_buffer, offset,
++                sizeof(uint64_t), 0));
++        return;
++    }
++
++    if (!d3d12_command_allocator_allocate_query_from_type_index(list->allocator,
++            type_index, &vk_query_pool, &vk_query_index))
++    {
++        ERR("Failed to allocate query.\n");
++        return;
++    }
++
++    VK_CALL(vkCmdWriteMicromapsPropertiesEXT(list->cmd.vk_command_buffer,
++            1, &vk_micromap, vk_query_type, vk_query_pool, vk_query_index));
++    VK_CALL(vkCmdCopyQueryPoolResults(list->cmd.vk_command_buffer,
++            vk_query_pool, vk_query_index, 1,
++            vk_buffer, offset, stride,
++            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
++}
++
++void vkd3d_opacity_micromap_emit_immediate_postbuild_info_ext(
++        struct d3d12_command_list *list, uint32_t count,
++        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc,
++        VkDeviceAddress va,
++        VkMicromapEXT vk_opacity_micromap)
++{
++    /* In D3D12 we are supposed to be able to emit without an explicit barrier,
++     * but we need to emit them for Vulkan. */
++
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkDependencyInfo dep_info;
++    VkMemoryBarrier2 barrier;
++    uint32_t i;
++
++    RT_TRACE("Emitting immediate postbuild info for micromap at VA %"PRIx64".\n", va);
++
++    /* Micromap writes are only ever visible through the MICROMAP access bits, and
++     * VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT is only valid in MICROMAP_BUILD stage. */
++    memset(&barrier, 0, sizeof(barrier));
++    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.srcAccessMask = VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT;
++    barrier.dstStageMask = VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT | VK_PIPELINE_STAGE_2_COPY_BIT;
++    barrier.dstAccessMask = VK_ACCESS_2_MICROMAP_READ_BIT_EXT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
++
++    memset(&dep_info, 0, sizeof(dep_info));
++    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep_info.memoryBarrierCount = 1;
++    dep_info.pMemoryBarriers = &barrier;
++
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
++
++    for (i = 0; i < count; i++)
++        vkd3d_opacity_micromap_write_postbuild_info_ext(list, &desc[i], vk_opacity_micromap);
++
++    vkd3d_opacity_micromap_end_barrier(list);
++}
++
+ static bool vkd3d_acceleration_structure_convert_opacity_micromap_index_type(const struct d3d12_device *device,
+         DXGI_FORMAT format, VkIndexType *result)
+ {
+@@ -253,6 +612,61 @@ bool vkd3d_acceleration_structure_convert_opacity_micromap(struct d3d12_device *
+     return true;
+ }
+ 
++static bool vkd3d_acceleration_structure_convert_opacity_micromap_index_type_ext(const struct d3d12_device *device,
++        DXGI_FORMAT format, VkIndexType *result)
++{
++    /* VUID-VkAccelerationStructureTrianglesOpacityMicromapEXT-indexType-10719 only permits UINT16,
++     * UINT32 and NONE_KHR. The KHR variant additionally permits UINT8, so this path has to be
++     * stricter regardless of VK_KHR_index_type_uint8. */
++    if (format == DXGI_FORMAT_R8_UINT)
++    {
++        FIXME_ONCE("R8_UINT OMM index buffer is not permitted by VK_EXT_opacity_micromap.\n");
++        return false;
++    }
++
++    return vkd3d_acceleration_structure_convert_opacity_micromap_index_type(device, format, result);
++}
++
++bool vkd3d_acceleration_structure_convert_opacity_micromap_ext(struct d3d12_device *device,
++        const D3D12_RAYTRACING_GEOMETRY_DESC *geom_desc,
++        VkAccelerationStructureGeometryKHR *geometry_info,
++        VkAccelerationStructureTrianglesOpacityMicromapEXT *omm_triangles_info)
++{
++    vk_prepend_struct(&geometry_info->geometry.triangles, omm_triangles_info);
++    omm_triangles_info->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT;
++    omm_triangles_info->pNext = NULL;
++
++    if (!vkd3d_acceleration_structure_convert_opacity_micromap_index_type_ext(device,
++            geom_desc->OmmTriangles.pOmmLinkage->OpacityMicromapIndexFormat, &omm_triangles_info->indexType))
++    {
++        return false;
++    }
++    omm_triangles_info->indexBuffer.deviceAddress =
++            geom_desc->OmmTriangles.pOmmLinkage->OpacityMicromapIndexBuffer.StartAddress;
++    omm_triangles_info->indexStride = geom_desc->OmmTriangles.pOmmLinkage->OpacityMicromapIndexBuffer.StrideInBytes;
++    omm_triangles_info->baseTriangle = geom_desc->OmmTriangles.pOmmLinkage->OpacityMicromapBaseLocation;
++
++    /* D3D12 only hands us a histogram when building the OMM array itself, never on the BLAS linkage.
++     * Republishing the one we remembered on the micromap view is opt-in behind
++     * VKD3D_CONFIG=omm_ext_linkage_usage_counts; by default this returns 0 so that
++     * d3d12_device_GetRaytracingAccelerationStructurePrebuildInfo and command recording, which both
++     * go through here at different points in time, cannot disagree. */
++    omm_triangles_info->usageCountsCount = vkd3d_opacity_micromap_lookup_usage_histogram_ext(device,
++            geom_desc->OmmTriangles.pOmmLinkage->OpacityMicromapArray, &omm_triangles_info->pUsageCounts);
++    omm_triangles_info->ppUsageCounts = NULL;
++
++    /* The handle is resolved by vkd3d_acceleration_structure_resolve_omm_va_maps_ext. */
++    omm_triangles_info->micromap = VK_NULL_HANDLE;
++
++    RT_TRACE("  OMM Index type: %s\n", debug_dxgi_format(geom_desc->OmmTriangles.pOmmLinkage->OpacityMicromapIndexFormat));
++    RT_TRACE("  OMM IBO VA: %"PRIx64"\n", geom_desc->OmmTriangles.pOmmLinkage->OpacityMicromapIndexBuffer.StartAddress);
++    RT_TRACE("  OMM Index stride: %"PRIu64" bytes\n", geom_desc->OmmTriangles.pOmmLinkage->OpacityMicromapIndexBuffer.StrideInBytes);
++    RT_TRACE("  OMM Base: %u\n", geom_desc->OmmTriangles.pOmmLinkage->OpacityMicromapBaseLocation);
++    RT_TRACE("  OMM Micromap VA: %"PRIx64"\n", geom_desc->OmmTriangles.pOmmLinkage->OpacityMicromapArray);
++
++    return true;
++}
++
+ bool vkd3d_acceleration_structure_resolve_omm_va_maps(struct d3d12_device *device,
+         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
+         VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos)
+@@ -286,3 +700,95 @@ bool vkd3d_acceleration_structure_resolve_omm_va_maps(struct d3d12_device *devic
+ 
+     return true;
+ }
++
++bool vkd3d_acceleration_structure_resolve_omm_va_maps_ext(struct d3d12_device *device,
++        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
++        VkAccelerationStructureTrianglesOpacityMicromapEXT *omm_triangles_infos)
++{
++    const D3D12_RAYTRACING_GEOMETRY_DESC *geom_desc;
++    D3D12_GPU_VIRTUAL_ADDRESS va;
++    unsigned int i;
++
++    if (desc->Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL)
++        return true;
++
++    for (i = 0; i < desc->NumDescs; i++)
++    {
++        if (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
++            geom_desc = desc->ppGeometryDescs[i];
++        else
++            geom_desc = &desc->pGeometryDescs[i];
++
++        if (geom_desc->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES)
++            continue;
++
++        va = geom_desc->OmmTriangles.pOmmLinkage->OpacityMicromapArray;
++        if (!va)
++            continue;
++
++        omm_triangles_infos[i].micromap = vkd3d_va_map_place_opacity_micromap_ext(
++                &device->memory_allocator.va_map, device, va);
++        if (omm_triangles_infos[i].micromap == VK_NULL_HANDLE)
++            return false;
++    }
++
++    return true;
++}
++
++static bool convert_copy_mode_ext(
++        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode,
++        VkCopyMicromapModeEXT *vk_mode)
++{
++    /* VkCopyMicromapModeEXT and VkCopyAccelerationStructureModeKHR use different numeric values for
++     * COMPACT and SERIALIZE, so this cannot share the acceleration structure converter. */
++    switch (mode)
++    {
++        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE:
++            *vk_mode = VK_COPY_MICROMAP_MODE_CLONE_EXT;
++            return true;
++        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT:
++            *vk_mode = VK_COPY_MICROMAP_MODE_COMPACT_EXT;
++            return true;
++        default:
++            /* SERIALIZE / DESERIALIZE. Nothing is recorded, so the destination keeps whatever it
++             * had; this is the same gap that makes the SERIALIZATION postbuild query report zero in
++             * vkd3d_opacity_micromap_write_postbuild_info_ext. Kept loud on purpose.
++             * FIXME: implement opacity micromap serialization on the EXT fallback. */
++            FIXME_ONCE("Opacity micromap copy mode #%x is not implemented on the "
++                    "VK_EXT_opacity_micromap fallback. Destination is left untouched.\n", mode);
++            return false;
++    }
++}
++
++void vkd3d_opacity_micromap_copy_ext(struct d3d12_command_list *list,
++        D3D12_GPU_VIRTUAL_ADDRESS dst, const struct vkd3d_view *src_omm_view,
++        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    struct vkd3d_view *dst_omm_view;
++    VkCopyMicromapInfoEXT info;
++
++    memset(&info, 0, sizeof(info));
++
++    /* Checked before the destination view is created, so an unsupported mode does not leave a
++     * micromap object sitting on a VA that never receives any data. */
++    if (!convert_copy_mode_ext(mode, &info.mode))
++        return;
++
++    dst_omm_view = vkd3d_va_map_place_opacity_micromap_view_ext(&list->device->memory_allocator.va_map,
++            list->device, dst);
++
++    if (!dst_omm_view)
++    {
++        ERR("Invalid dst address #%"PRIx64" for opacity micromap copy.\n", dst);
++        return;
++    }
++
++    vkd3d_opacity_micromap_inherit_usage_histogram_ext(dst_omm_view, src_omm_view);
++
++    info.sType = VK_STRUCTURE_TYPE_COPY_MICROMAP_INFO_EXT;
++    info.dst = dst_omm_view->vk_micromap;
++    info.src = src_omm_view->vk_micromap;
++
++    VK_CALL(vkCmdCopyMicromapEXT(list->cmd.vk_command_buffer, &info));
++}
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -231,6 +231,16 @@ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
+         /* This is always allowed. Used for vertex/index buffer inputs to RTAS build. */
+         buffer_info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                 VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR;
++
++        /* VK_EXT_opacity_micromap places VkMicromapEXT on top of a VkBuffer, which requires its own
++         * usage bits. VK_KHR_opacity_micromap reuses the acceleration structure ones, so this must
++         * stay conditional or every buffer would get a different memoryTypeBits on KHR devices. */
++        if (d3d12_device_uses_ext_opacity_micromap(device))
++        {
++            if (heap_type == D3D12_HEAP_TYPE_DEFAULT || !is_cpu_accessible_heap(heap_properties))
++                buffer_info.usage |= VK_BUFFER_USAGE_MICROMAP_STORAGE_BIT_EXT;
++            buffer_info.usage |= VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT;
++        }
+     }
+ 
+     if (heap_type == D3D12_HEAP_TYPE_UPLOAD)
+@@ -1367,6 +1377,7 @@ static uint32_t vkd3d_view_entry_hash(const void *key)
+     {
+         case VKD3D_VIEW_TYPE_BUFFER:
+         case VKD3D_VIEW_TYPE_ACCELERATION_STRUCTURE:
++        case VKD3D_VIEW_TYPE_OPACITY_MICROMAP_EXT:
+             hash = hash_uint64((uint64_t)k->u.buffer.buffer);
+             hash = hash_combine(hash, hash_uint64(k->u.buffer.offset));
+             hash = hash_combine(hash, hash_uint64(k->u.buffer.size));
+@@ -1435,6 +1446,7 @@ static bool vkd3d_view_entry_compare(const void *key, const struct hash_map_entr
+     {
+         case VKD3D_VIEW_TYPE_BUFFER:
+         case VKD3D_VIEW_TYPE_ACCELERATION_STRUCTURE:
++        case VKD3D_VIEW_TYPE_OPACITY_MICROMAP_EXT:
+             return k->u.buffer.buffer == e->key.u.buffer.buffer &&
+                     k->u.buffer.format == e->key.u.buffer.format &&
+                     k->u.buffer.offset == e->key.u.buffer.offset &&
+@@ -1596,6 +1608,11 @@ struct vkd3d_view *vkd3d_view_map_create_view2(struct vkd3d_view_map *view_map,
+             success = vkd3d_create_acceleration_structure_view(device, &key->u.buffer, &view, rtas_kind);
+             break;
+ 
++        case VKD3D_VIEW_TYPE_OPACITY_MICROMAP_EXT:
++            /* rtas_kind is meaningless here, a micromap is never a TLAS. */
++            success = vkd3d_create_opacity_micromap_view_ext(device, &key->u.buffer, &view);
++            break;
++
+         default:
+             ERR("Unsupported view type %u.\n", key->view_type);
+             success = false;
+@@ -4950,6 +4967,22 @@ static void vkd3d_view_destroy(struct vkd3d_view *view, struct d3d12_device *dev
+         case VKD3D_VIEW_TYPE_ACCELERATION_STRUCTURE:
+             VK_CALL(vkDestroyAccelerationStructureKHR(device->vk_device, view->vk_acceleration_structure, NULL));
+             break;
++        case VKD3D_VIEW_TYPE_OPACITY_MICROMAP_EXT:
++        {
++            /* Only this view type ever has omm_histogram_ext; the same union slot is info.texture
++             * elsewhere. Single threaded, refcount already hit zero, and the owning allocation is
++             * going away, so no command list can still be reading these nodes. */
++            struct vkd3d_omm_usage_histogram_ext *histogram, *histogram_next;
++
++            for (histogram = view->info.buffer.omm_histogram_ext; histogram; histogram = histogram_next)
++            {
++                histogram_next = histogram->next;
++                vkd3d_free(histogram);
++            }
++
++            VK_CALL(vkDestroyMicromapEXT(device->vk_device, view->vk_micromap, NULL));
++            break;
++        }
+         default:
+             WARN("Unhandled view type %d.\n", view->type);
+     }
+@@ -5333,6 +5366,46 @@ bool vkd3d_create_acceleration_structure_view(struct d3d12_device *device, const
+     return true;
+ }
+ 
++bool vkd3d_create_opacity_micromap_view_ext(struct d3d12_device *device,
++        const struct vkd3d_buffer_view_desc *desc, struct vkd3d_view **view)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VkMicromapCreateInfoEXT create_info;
++    struct vkd3d_view *object;
++    VkMicromapEXT vk_micromap;
++    VkResult result;
++
++    /* Unlike VK_KHR_opacity_micromap there is no device address based creation path and no
++     * vkGetMicromapDeviceAddressEXT, so the (buffer, offset, size) triple is all there is. */
++    memset(&create_info, 0, sizeof(create_info));
++    create_info.sType = VK_STRUCTURE_TYPE_MICROMAP_CREATE_INFO_EXT;
++    create_info.buffer = desc->buffer;
++    create_info.offset = desc->offset;
++    create_info.size = desc->size;
++    create_info.type = VK_MICROMAP_TYPE_OPACITY_MICROMAP_EXT;
++
++    result = VK_CALL(vkCreateMicromapEXT(device->vk_device, &create_info, NULL, &vk_micromap));
++
++    if (result != VK_SUCCESS)
++        return false;
++
++    if (!(object = vkd3d_view_create(VKD3D_VIEW_TYPE_OPACITY_MICROMAP_EXT)))
++    {
++        VK_CALL(vkDestroyMicromapEXT(device->vk_device, vk_micromap, NULL));
++        return false;
++    }
++
++    object->vk_micromap = vk_micromap;
++    object->format = desc->format;
++    object->info.buffer.offset = desc->offset;
++    object->info.buffer.size = desc->size;
++    object->info.buffer.rtas_kind = VKD3D_RTAS_KIND_UNKNOWN; /* Pre-publish, no atomic store required */
++    /* vkd3d_view_create does not memset, and vkd3d_view_destroy walks this list. */
++    object->info.buffer.omm_histogram_ext = NULL; /* Pre-publish, no atomic store required */
++    *view = object;
++    return true;
++}
++
+ #define VKD3D_VIEW_RAW_BUFFER 0x1
+ #define VKD3D_VIEW_BUFFER_SRV 0x2
+ 
+@@ -11193,6 +11266,24 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
+                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+     }
+ 
++    /* Same shape as the acceleration structure block above: the probe deliberately takes the widest
++     * mask vkd3d_create_buffer can produce, i.e. including MICROMAP_STORAGE which real buffers only
++     * get on non CPU visible heaps (resource.c, vkd3d_create_buffer). That can only narrow
++     * memoryTypeBits for UPLOAD / READBACK, never widen it past what a buffer really supports.
++     * The RT gate must NOT go through d3d12_device_supports_ray_tracing_tier_1_0 here: that reads
++     * d3d12_caps.options5.RaytracingTier, and d3d12_device_caps_init runs after
++     * vkd3d_memory_info_init, so the condition would be false on every device. Same limitation as
++     * the "Caps are not necessarily overridden yet" note above, so spell the gate out with the
++     * device_info features, which are ready by the time we get here. */
++    if (device->device_info.acceleration_structure_features.accelerationStructure &&
++            device->device_info.ray_tracing_pipeline_features.rayTracingPipeline &&
++            d3d12_device_uses_ext_opacity_micromap(device))
++    {
++        buffer_info.usage |=
++                VK_BUFFER_USAGE_MICROMAP_STORAGE_BIT_EXT |
++                VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT;
++    }
++
+     VK_CALL(vkGetDeviceBufferMemoryRequirements(device->vk_device, &buffer_requirement_info, &memory_requirements));
+     buffer_type_mask = memory_requirements.memoryRequirements.memoryTypeBits;
+ 
+diff --git a/libs/vkd3d/va_map.c b/libs/vkd3d/va_map.c
+--- a/libs/vkd3d/va_map.c
++++ b/libs/vkd3d/va_map.c
+@@ -284,6 +284,45 @@ void vkd3d_va_map_try_read_rtas(struct vkd3d_va_map *va_map,
+         vkd3d_atomic_uint32_load_explicit(&view->info.buffer.rtas_kind, vkd3d_memory_order_relaxed);
+ }
+ 
++const struct vkd3d_view *vkd3d_va_map_try_read_opacity_micromap_view_ext(struct vkd3d_va_map *va_map,
++        struct d3d12_device *device, VkDeviceAddress va)
++{
++    const struct vkd3d_unique_resource *resource;
++    struct vkd3d_view_map *view_map;
++    struct vkd3d_view_key key;
++
++    resource = vkd3d_va_map_deref(va_map, va);
++    if (!resource || !resource->va)
++        return NULL;
++
++    view_map = vkd3d_atomic_ptr_load_explicit(&resource->view_map, vkd3d_memory_order_acquire);
++    if (!view_map)
++        return NULL;
++
++    key.view_type = VKD3D_VIEW_TYPE_OPACITY_MICROMAP_EXT;
++    key.u.buffer.buffer = resource->vk_buffer;
++    key.u.buffer.offset = va - resource->va;
++    key.u.buffer.size = resource->size - key.u.buffer.offset;
++    key.u.buffer.format = NULL;
++    key.u.buffer.usage = 0;
++
++    /* Deliberately vkd3d_view_map_get_view and not create_view; a prebuild sizing query must never
++     * make a micromap appear at a VA which has not been built yet. */
++    return vkd3d_view_map_get_view(view_map, device, &key);
++}
++
++VkMicromapEXT vkd3d_va_map_try_read_opacity_micromap_ext(struct vkd3d_va_map *va_map,
++        struct d3d12_device *device, VkDeviceAddress va)
++{
++    const struct vkd3d_view *view;
++
++    view = vkd3d_va_map_try_read_opacity_micromap_view_ext(va_map, device, va);
++    if (!view)
++        return VK_NULL_HANDLE;
++
++    return view->vk_micromap;
++}
++
+ const char *vkd3d_get_rtas_kind_string(enum vkd3d_rtas_kind rtas_kind)
+ {
+     switch (rtas_kind)
+@@ -387,6 +426,69 @@ VkAccelerationStructureKHR vkd3d_va_map_place_acceleration_structure(struct vkd3
+     return view->vk_acceleration_structure;
+ }
+ 
++struct vkd3d_view *vkd3d_va_map_place_opacity_micromap_view_ext(struct vkd3d_va_map *va_map,
++        struct d3d12_device *device, VkDeviceAddress va)
++{
++    struct vkd3d_unique_resource *resource;
++    struct vkd3d_view_map *old_view_map;
++    struct vkd3d_view_map *view_map;
++    struct vkd3d_view_key key;
++
++    resource = vkd3d_va_map_deref_mutable(va_map, va);
++    if (!resource || !resource->va)
++        return NULL;
++
++    view_map = vkd3d_atomic_ptr_load_explicit(&resource->view_map, vkd3d_memory_order_acquire);
++    if (!view_map)
++    {
++        /* This is the first time we attempt to place an AS on top of this allocation, so
++         * CAS in a pointer. */
++        view_map = vkd3d_malloc(sizeof(*view_map));
++        if (!view_map)
++            return NULL;
++
++        if (FAILED(vkd3d_view_map_init(view_map)))
++        {
++            vkd3d_free(view_map);
++            return NULL;
++        }
++
++        /* Need to release in case other RTASes are placed at the same time, so they observe
++         * the initialized view map, and need to acquire if some other thread placed it. */
++        old_view_map = vkd3d_atomic_ptr_compare_exchange(&resource->view_map, NULL, view_map,
++                vkd3d_memory_order_release, vkd3d_memory_order_acquire);
++        if (old_view_map)
++        {
++            vkd3d_view_map_destroy(view_map, device);
++            vkd3d_free(view_map);
++            view_map = old_view_map;
++        }
++    }
++
++    key.view_type = VKD3D_VIEW_TYPE_OPACITY_MICROMAP_EXT;
++    key.u.buffer.buffer = resource->vk_buffer;
++    key.u.buffer.offset = va - resource->va;
++    key.u.buffer.size = resource->size - key.u.buffer.offset;
++    key.u.buffer.format = NULL;
++    key.u.buffer.usage = 0;
++
++    /* No rtas_kind state machine here. rtas_kind only gates BLP emission on SERIALIZATION postbuild,
++     * and a micromap never reaches that path, so the view keeps its initial UNKNOWN. */
++    return vkd3d_view_map_create_view(view_map, device, &key);
++}
++
++VkMicromapEXT vkd3d_va_map_place_opacity_micromap_ext(struct vkd3d_va_map *va_map,
++        struct d3d12_device *device, VkDeviceAddress va)
++{
++    struct vkd3d_view *view;
++
++    view = vkd3d_va_map_place_opacity_micromap_view_ext(va_map, device, va);
++    if (!view)
++        return VK_NULL_HANDLE;
++
++    return view->vk_micromap;
++}
++
+ void vkd3d_va_map_init(struct vkd3d_va_map *va_map)
+ {
+     memset(va_map, 0, sizeof(*va_map));
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -197,6 +197,7 @@ struct vkd3d_vulkan_info
+     bool EXT_shader_float8;
+     bool EXT_present_timing;
+     bool EXT_descriptor_heap;
++    bool EXT_opacity_micromap;
+     /* AMD device extensions */
+     bool AMD_buffer_marker;
+     bool AMD_device_coherent_memory;
+@@ -339,6 +340,7 @@ HRESULT vkd3d_enqueue_timeline_semaphore(struct vkd3d_fence_worker *worker,
+         const struct vkd3d_queue_timeline_trace_cookie *timeline_cookie);
+ 
+ struct vkd3d_unique_resource;
++struct vkd3d_view;
+ 
+ enum vkd3d_rtas_kind
+ {
+@@ -350,6 +352,41 @@ enum vkd3d_rtas_kind
+     VKD3D_RTAS_KIND_MUTATED,
+ };
+ 
++/* VK_EXT_opacity_micromap exposes a separate object model (VkMicromapEXT) rather than reusing
++ * VkAccelerationStructureKHR, so the RTAS batch arrays have a different element type depending on
++ * which backend is active. The structures are not layout compatible either; the EXT triangle linkage
++ * carries usage counts and the EXT build info is a top level structure instead of a pNext link. */
++union vkd3d_omm_triangles_info
++{
++    VkAccelerationStructureTrianglesOpacityMicromapKHR *khr;
++    VkAccelerationStructureTrianglesOpacityMicromapEXT *ext;
++};
++
++union vkd3d_omm_build_info
++{
++    VkAccelerationStructureGeometryMicromapDataKHR *khr;
++    VkMicromapBuildInfoEXT *ext;
++};
++
++union vkd3d_omm_usage_info
++{
++    VkMicromapUsageKHR *khr;
++    VkMicromapUsageEXT *ext;
++};
++
++/* D3D12 hands us the OMM histogram when the OMM array is built, but not again on the BLAS linkage
++ * where VK_EXT_opacity_micromap wants it. Remember it on the micromap view so that the linkage can
++ * republish the exact same numbers the application already gave us.
++ * Immutable after publication and never unlinked; nodes are only freed in vkd3d_view_destroy, so a
++ * command list which already stored node->usages in a VkAccelerationStructureTrianglesOpacityMicromapEXT
++ * cannot observe freed memory. */
++struct vkd3d_omm_usage_histogram_ext
++{
++    struct vkd3d_omm_usage_histogram_ext *next;
++    uint32_t count;
++    VkMicromapUsageEXT usages[];
++};
++
+ struct vkd3d_va_entry
+ {
+     DECLSPEC_ALIGN(8) VkDeviceAddress va;
+@@ -411,6 +448,16 @@ VkAccelerationStructureKHR vkd3d_va_map_place_acceleration_structure(struct vkd3
+         struct d3d12_device *device,
+         VkDeviceAddress va,
+         enum vkd3d_rtas_kind rtas_kind);
++VkMicromapEXT vkd3d_va_map_try_read_opacity_micromap_ext(struct vkd3d_va_map *va_map,
++        struct d3d12_device *device, VkDeviceAddress va);
++VkMicromapEXT vkd3d_va_map_place_opacity_micromap_ext(struct vkd3d_va_map *va_map,
++        struct d3d12_device *device, VkDeviceAddress va);
++/* The view carries the OMM usage histogram in addition to the handle, see
++ * struct vkd3d_omm_usage_histogram_ext. */
++const struct vkd3d_view *vkd3d_va_map_try_read_opacity_micromap_view_ext(struct vkd3d_va_map *va_map,
++        struct d3d12_device *device, VkDeviceAddress va);
++struct vkd3d_view *vkd3d_va_map_place_opacity_micromap_view_ext(struct vkd3d_va_map *va_map,
++        struct d3d12_device *device, VkDeviceAddress va);
+ void vkd3d_va_map_init(struct vkd3d_va_map *va_map);
+ void vkd3d_va_map_cleanup(struct vkd3d_va_map *va_map);
+ void vkd3d_va_map_insert_descriptor_heap(struct vkd3d_va_map *va_map,
+@@ -1323,7 +1370,11 @@ enum vkd3d_view_type
+     VKD3D_VIEW_TYPE_BUFFER,
+     VKD3D_VIEW_TYPE_IMAGE,
+     VKD3D_VIEW_TYPE_SAMPLER,
+-    VKD3D_VIEW_TYPE_ACCELERATION_STRUCTURE
++    VKD3D_VIEW_TYPE_ACCELERATION_STRUCTURE,
++    /* Only ever created when VK_EXT_opacity_micromap is the active backend. A dedicated view type,
++     * rather than a key field, keeps VkMicromapEXT and VkAccelerationStructureKHR from colliding on
++     * the same VA without perturbing the hash of any KHR view. */
++    VKD3D_VIEW_TYPE_OPACITY_MICROMAP_EXT
+ };
+ 
+ struct vkd3d_view
+@@ -1338,6 +1389,7 @@ struct vkd3d_view
+         VkImageView vk_image_view;
+         VkSampler vk_sampler;
+         VkAccelerationStructureKHR vk_acceleration_structure;
++        VkMicromapEXT vk_micromap;
+     };
+     const struct vkd3d_format *format;
+     union
+@@ -1347,6 +1399,11 @@ struct vkd3d_view
+             VkDeviceSize offset;
+             VkDeviceSize size;
+             uint32_t rtas_kind; /* not hashed; accessed atomically; stores vkd3d_rtas_kind */
++            /* Only ever touched for VKD3D_VIEW_TYPE_OPACITY_MICROMAP_EXT. Head of a push-only stack,
++             * accessed atomically. Fits in the tail padding this union already has (info.texture is
++             * 28 bytes at alignment 8), so sizeof(struct vkd3d_view) does not change. Do not grow
++             * info.texture without rechecking that. */
++            struct vkd3d_omm_usage_histogram_ext *omm_histogram_ext;
+         } buffer;
+         struct
+         {
+@@ -1397,6 +1454,8 @@ bool vkd3d_create_raw_r32ui_vk_buffer_view(struct d3d12_device *device,
+         VkBuffer vk_buffer, VkDeviceSize offset, VkDeviceSize range, VkBufferView *vk_view);
+ bool vkd3d_create_acceleration_structure_view(struct d3d12_device *device,
+         const struct vkd3d_buffer_view_desc *desc, struct vkd3d_view **view, enum vkd3d_rtas_kind rtas_kind);
++bool vkd3d_create_opacity_micromap_view_ext(struct d3d12_device *device,
++        const struct vkd3d_buffer_view_desc *desc, struct vkd3d_view **view);
+ bool vkd3d_create_texture_view(struct d3d12_device *device,
+         const struct vkd3d_texture_view_desc *desc, struct vkd3d_view **view);
+ 
+@@ -2712,7 +2771,11 @@ struct vkd3d_scratch_buffer
+ #define VKD3D_QUERY_TYPE_INDEX_RT_SERIALIZE_SIZE (4u)
+ #define VKD3D_QUERY_TYPE_INDEX_RT_CURRENT_SIZE (5u)
+ #define VKD3D_QUERY_TYPE_INDEX_RT_SERIALIZE_SIZE_BOTTOM_LEVEL_POINTERS (6u)
+-#define VKD3D_VIRTUAL_QUERY_TYPE_COUNT (7u)
++/* A query pool has a fixed VkQueryType, so the EXT micromap queries cannot share the RTAS pools.
++ * The pools are only ever created on demand, so these indices cost nothing when KHR is active. */
++#define VKD3D_QUERY_TYPE_INDEX_OMM_COMPACTED_SIZE (7u)
++#define VKD3D_QUERY_TYPE_INDEX_OMM_SERIALIZE_SIZE (8u)
++#define VKD3D_VIRTUAL_QUERY_TYPE_COUNT (9u)
+ #define VKD3D_VIRTUAL_QUERY_POOL_COUNT (128u)
+ 
+ struct vkd3d_query_pool
+@@ -3154,7 +3217,14 @@ struct d3d12_wbi_batch_state
+ 
+ struct vk_acceleration_structure_postbuild_info
+ {
+-    VkAccelerationStructureKHR rtas_vk;
++    /* micromap_ext is only valid if is_omm is set and VK_EXT_opacity_micromap is the active backend.
++     * Both variants are non-dispatchable handles, so testing rtas against VK_NULL_HANDLE is valid
++     * regardless of which variant was written. */
++    union
++    {
++        VkAccelerationStructureKHR rtas;
++        VkMicromapEXT micromap_ext;
++    } rtas_vk;
+     D3D12_GPU_VIRTUAL_ADDRESS rtas_va; /* Should always be set. If rtas_vk is set, this is just used for debug. */
+     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC desc;
+     bool is_omm; /* Only used for rtas_vk if not null handle. */
+@@ -3175,7 +3245,7 @@ struct d3d12_rtas_batch_state
+     size_t geometry_info_count;
+     size_t geometry_info_size;
+ 
+-    VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos;
++    union vkd3d_omm_triangles_info omm_triangles_infos;
+     size_t omm_triangles_info_size;
+ 
+     VkAccelerationStructureBuildRangeInfoKHR *range_infos;
+@@ -3184,11 +3254,11 @@ struct d3d12_rtas_batch_state
+     const VkAccelerationStructureBuildRangeInfoKHR **range_ptrs;
+     size_t range_ptr_size;
+ 
+-    VkAccelerationStructureGeometryMicromapDataKHR *omm_build_infos;
++    union vkd3d_omm_build_info omm_build_infos;
+     size_t omm_build_info_count;
+     size_t omm_build_info_size;
+ 
+-    VkMicromapUsageKHR *omm_usage_infos;
++    union vkd3d_omm_usage_info omm_usage_infos;
+     size_t omm_usage_info_count;
+     size_t omm_usage_info_size;
+ 
+@@ -5415,6 +5485,8 @@ struct vkd3d_physical_device_info
+     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative_matrix_features;
+     VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT zero_initialize_device_memory_features;
+     VkPhysicalDeviceOpacityMicromapFeaturesKHR opacity_micromap_features;
++    /* Deliberately not named _khr to keep the KHR probing paths byte identical. */
++    VkPhysicalDeviceOpacityMicromapFeaturesEXT opacity_micromap_features_ext;
+     VkPhysicalDeviceIndexTypeUint8FeaturesKHR index_type_uint8_features;
+     VkPhysicalDeviceShaderFloat8FeaturesEXT shader_float8_features;
+     VkPhysicalDeviceCooperativeMatrix2FeaturesNV cooperative_matrix2_features_nv;
+@@ -5433,7 +5505,11 @@ struct vkd3d_physical_device_info
+ 
+     VkPhysicalDeviceFeatures2 features2;
+ 
++    /* Gate for "opacity micromap works at all", regardless of which backend implements it. */
+     bool supports_opacity_micromap;
++    /* Discriminates the backend. VK_KHR_opacity_micromap is always preferred, VK_EXT_opacity_micromap
++     * is only ever used when the device does not expose KHR at all. */
++    bool using_khr_opacity_micromap;
+ 
+     /* others, for extensions that have no feature bits */
+     uint32_t time_domains;  /* vkd3d_time_domain_flag */
+@@ -6263,6 +6339,15 @@ static inline bool d3d12_device_use_ssbo_root_descriptors(struct d3d12_device *d
+ bool d3d12_device_supports_variable_shading_rate_tier_1(struct d3d12_device *device);
+ bool d3d12_device_supports_variable_shading_rate_tier_2(struct d3d12_device *device);
+ bool d3d12_device_supports_ray_tracing_tier_1_0(const struct d3d12_device *device);
++
++/* Canonical spelling of the opacity micromap backend test. The KHR path tests
++ * using_khr_opacity_micromap directly; supports_opacity_micromap is never a backend discriminator. */
++static inline bool d3d12_device_uses_ext_opacity_micromap(const struct d3d12_device *device)
++{
++    return device->device_info.supports_opacity_micromap &&
++            !device->device_info.using_khr_opacity_micromap;
++}
++
+ UINT d3d12_determine_shading_rate_image_tile_size(struct d3d12_device *device);
+ bool d3d12_device_supports_required_subgroup_size_for_stage(
+         struct d3d12_device *device, VkShaderStageFlagBits stage);
+@@ -7034,12 +7119,15 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
+         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
+         VkAccelerationStructureBuildGeometryInfoKHR *build_info,
+         VkAccelerationStructureGeometryKHR *geometry_infos,
+-        VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos,
++        const union vkd3d_omm_triangles_info *omm_triangles_infos,
+         VkAccelerationStructureBuildRangeInfoKHR *range_infos,
+         uint32_t *primitive_counts);
+ bool vkd3d_acceleration_structure_resolve_omm_va_maps(struct d3d12_device *device,
+         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
+         VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos);
++bool vkd3d_acceleration_structure_resolve_omm_va_maps_ext(struct d3d12_device *device,
++        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
++        VkAccelerationStructureTrianglesOpacityMicromapEXT *omm_triangles_infos);
+ void vkd3d_acceleration_structure_flush_postbuild_batch(struct d3d12_command_list *list,
+         const struct vk_acceleration_structure_postbuild_info *infos, size_t count);
+ void vkd3d_acceleration_structure_write_postbuild_info(
+@@ -7070,6 +7158,28 @@ bool vkd3d_acceleration_structure_convert_opacity_micromap(struct d3d12_device *
+         VkAccelerationStructureGeometryKHR *geometry_info,
+         VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_info);
+ 
++/* VK_EXT_opacity_micromap fallback entry points. */
++bool vkd3d_opacity_micromap_convert_inputs_ext(const struct d3d12_device *device,
++        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *inputs,
++        VkMicromapBuildInfoEXT *build_info,
++        VkMicromapUsageEXT *usages);
++void vkd3d_opacity_micromap_emit_immediate_postbuild_info_ext(
++        struct d3d12_command_list *list, uint32_t count,
++        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc,
++        VkDeviceAddress va,
++        VkMicromapEXT vk_opacity_micromap);
++bool vkd3d_acceleration_structure_convert_opacity_micromap_ext(struct d3d12_device *device,
++        const D3D12_RAYTRACING_GEOMETRY_DESC *geom_desc,
++        VkAccelerationStructureGeometryKHR *geometry_info,
++        VkAccelerationStructureTrianglesOpacityMicromapEXT *omm_triangles_info);
++void vkd3d_opacity_micromap_copy_ext(struct d3d12_command_list *list,
++        D3D12_GPU_VIRTUAL_ADDRESS dst, const struct vkd3d_view *src_omm_view,
++        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode);
++void vkd3d_opacity_micromap_publish_usage_histogram_ext(struct vkd3d_view *view,
++        const D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC *desc);
++uint32_t vkd3d_opacity_micromap_lookup_usage_histogram_ext(struct d3d12_device *device,
++        D3D12_GPU_VIRTUAL_ADDRESS va, const VkMicromapUsageEXT **usages);
++
+ typedef enum D3D11_USAGE
+ {
+     D3D11_USAGE_DEFAULT,
+diff --git a/libs/vkd3d/vulkan_procs.h b/libs/vkd3d/vulkan_procs.h
+--- a/libs/vkd3d/vulkan_procs.h
++++ b/libs/vkd3d/vulkan_procs.h
+@@ -222,6 +222,15 @@ VK_DEVICE_EXT_PFN(vkCmdBuildAccelerationStructuresKHR)
+ VK_DEVICE_EXT_PFN(vkCmdWriteAccelerationStructuresPropertiesKHR)
+ VK_DEVICE_EXT_PFN(vkCmdCopyAccelerationStructureKHR)
+ 
++/* VK_EXT_opacity_micromap. Only used as a fallback when VK_KHR_opacity_micromap is not present.
++ * Host commands and serialization to memory are not used, so they are not loaded. */
++VK_DEVICE_EXT_PFN(vkGetMicromapBuildSizesEXT)
++VK_DEVICE_EXT_PFN(vkCreateMicromapEXT)
++VK_DEVICE_EXT_PFN(vkDestroyMicromapEXT)
++VK_DEVICE_EXT_PFN(vkCmdBuildMicromapsEXT)
++VK_DEVICE_EXT_PFN(vkCmdWriteMicromapsPropertiesEXT)
++VK_DEVICE_EXT_PFN(vkCmdCopyMicromapEXT)
++
+ /* VK_KHR_fragment_shading_rate */
+ VK_INSTANCE_EXT_PFN(vkGetPhysicalDeviceFragmentShadingRatesKHR)
+ VK_DEVICE_EXT_PFN(vkCmdSetFragmentShadingRateKHR)

@@ -1,0 +1,112 @@
+From: Claude (Anthropic AI) <noreply@anthropic.com>
+Subject: [PATCH] winewayland: Do not rerun the window state update from set_clip.
+
+wineland-child-rendering/0036-winewayland-Avoid-win-data-lookup-in-set-clip.patch
+replaced the synchronous region sync in wayland_window_surface_set_clip()
+with an NtUserPostMessage(WM_WINE_UPDATEWINDOWSTATE). That message does far
+more than a region sync: win32u dispatches it to update_window_state(),
+which calls apply_window_pos() and makes the driver re-evaluate the toplevel
+configure state from scratch.
+
+By the time the posted message is handled, the compositor configure has been
+processed and surface->processing.serial is 0, so
+wayland_win_data_get_config() no longer takes the pending-config branch and
+falls through to the "else if (fullscreen)" classification in
+dlls/winewayland.drv/window.c. A borderless window that the compositor
+maximized (WS_POPUP|WS_MAXIMIZE, no WS_CAPTION) fails the MAXIMIZED test
+there and is classified as FULLSCREEN, so the driver calls
+xdg_toplevel_set_fullscreen() on a window that was merely tiled/maximized.
+
+Observed with the Cyberpunk 2077 REDlauncher under Hyprland: the launcher
+came up as a real fullscreen surface (hyprctl: fullscreen=2,
+size=[2560,1440]) instead of its 854x512 window. Logs show the extra
+WAYLAND_WindowPosChanging with swp_flags 181f arriving ~16 ms after
+wayland_window_surface_set_clip(), followed by
+wayland_surface_update_state_toplevel window_state=0x8 (FULLSCREEN) where
+the state had been 0x5 (MAXIMIZED|TILED).
+
+Keep the intent of 0036 (no wayland_win_data lookup inside set_clip, which
+runs with the window_surface mutex held) but post a dedicated driver message
+that only performs the region sync, exactly like the pre-0036 code did.
+
+Autor: Claude (Anthropic AI), na zlecenie i pod nadzorem wlasciciela repozytorium.
+---
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -88,6 +88,7 @@
+     WM_WAYLAND_DMABUF_FRAME,
+     WM_WAYLAND_EXPOSE,
+     WM_WAYLAND_RECALC_CLIENT_RECT,
++    WM_WAYLAND_SYNC_REGIONS,
+ };
+ 
+ enum wayland_surface_config_state
+@@ -709,6 +710,7 @@
+                                  HRGN damage_region, BOOL content_over_producer);
+ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
+ void ensure_window_surface_contents(HWND hwnd);
++void wayland_sync_window_surface_regions(HWND hwnd);
+ void wayland_window_init(void);
+ BOOL wayland_is_popup_menu_class(HWND hwnd);
+ BOOL wayland_is_layer_menu_hwnd(HWND hwnd);
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1334,6 +1334,11 @@
+          * window-thread lock order. */
+         NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
+         return 0;
++    case WM_WAYLAND_SYNC_REGIONS:
++        /* Deferred shape/clip region sync posted by
++         * wayland_window_surface_set_clip(). */
++        wayland_sync_window_surface_regions(hwnd);
++        return 0;
+     default:
+         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
+         return 0;
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -904,8 +904,13 @@
+     }
+     wws->occlusion_clipped = occlusion_clipped;
+ 
++    /* Defer the region sync to the window thread, so that we don't need a
++     * win_data lookup here. Do NOT post WM_WINE_UPDATEWINDOWSTATE: that runs
++     * the full update_window_state()/apply_window_pos() path, which
++     * re-evaluates the toplevel configure state from scratch and promotes a
++     * compositor-maximized borderless window to fullscreen. */
+     if (window_surface->hwnd)
+-        NtUserPostMessage(window_surface->hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
++        NtUserPostMessage(window_surface->hwnd, WM_WAYLAND_SYNC_REGIONS, 0, 0);
+ }
+ 
+ /**********************************************************************
+@@ -942,6 +947,27 @@
+ }
+ 
+ /**********************************************************************
++ *          wayland_sync_window_surface_regions
++ *
++ * Window-thread handler for WM_WAYLAND_SYNC_REGIONS. Performs the region
++ * sync that wayland_window_surface_set_clip() defers, taking the same locks
++ * in the same order as the wayland_window_surface_flush() path.
++ */
++void wayland_sync_window_surface_regions(HWND hwnd)
++{
++    struct window_surface *window_surface;
++
++    if (!hwnd) return;
++    if (!(window_surface = window_surface_get(hwnd))) return;
++
++    window_surface_lock(window_surface);
++    wayland_window_surface_sync_regions(window_surface);
++    window_surface_unlock(window_surface);
++
++    window_surface_release(window_surface);
++}
++
++/**********************************************************************
+  *          copy_pixel_region
+  */
+ static void copy_pixel_region(const char *src_pixels, RECT *src_rect,
+-- 
+2.55.0

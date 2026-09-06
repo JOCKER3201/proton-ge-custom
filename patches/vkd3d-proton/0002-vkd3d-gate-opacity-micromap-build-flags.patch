@@ -1,0 +1,72 @@
+From: Claude (Anthropic AI) <noreply@anthropic.com>
+Subject: [PATCH] vkd3d: Gate opacity micromap build flags on actual support.
+
+VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_OPACITY_MICROMAP_UPDATE_BIT_KHR and
+VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_BIT_KHR are both defined by the
+opacity micromap extension, so setting either of them without that extension enabled is a valid
+usage violation.
+
+d3d12_build_flags_to_vk() translated the matching D3D12 flags unconditionally. An application that
+passes ALLOW_OMM_LINKAGE_UPDATE or ALLOW_DISABLE_OMMS even though we report no opacity micromap
+support therefore poisoned every single bottom level acceleration structure build, on the default
+code path, with no diagnostic.
+
+Thread the device through and only translate those two bits when opacity micromaps are actually
+supported, with a FIXME_ONCE otherwise.
+
+Found while investigating a GPU hang in Cyberpunk 2077; it is not the cause of that hang, but it is
+a real latent violation that is worth fixing on its own.
+
+Autor: Claude (Anthropic AI), na zlecenie i pod nadzorem wlasciciela repozytorium.
+diff --git a/libs/vkd3d/acceleration_structure.c b/libs/vkd3d/acceleration_structure.c
+index 3d89bf60..72900e63 100644
+--- a/libs/vkd3d/acceleration_structure.c
++++ b/libs/vkd3d/acceleration_structure.c
+@@ -21,7 +21,7 @@
+ 
+ #define RT_TRACE TRACE
+ 
+-static VkBuildAccelerationStructureFlagsKHR d3d12_build_flags_to_vk(
++static VkBuildAccelerationStructureFlagsKHR d3d12_build_flags_to_vk(const struct d3d12_device *device,
+         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS flags)
+ {
+     VkBuildAccelerationStructureFlagsKHR vk_flags = 0;
+@@ -36,13 +36,24 @@ static VkBuildAccelerationStructureFlagsKHR d3d12_build_flags_to_vk(
+         vk_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+     if (flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE)
+         vk_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+-    if (flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_OMM_LINKAGE_UPDATE)
++    /* Both bits are defined by the opacity micromap extension, so setting them without it is a VU
++     * violation. An application that passes these D3D12 flags even though we report no opacity
++     * micromap support would otherwise poison every single BLAS build. */
++    if (device->device_info.supports_opacity_micromap)
+     {
+-        /* D3D12 spec isn't clear on what is allowed to be updated and when */
+-        vk_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_OPACITY_MICROMAP_UPDATE_BIT_KHR;
++        if (flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_OMM_LINKAGE_UPDATE)
++        {
++            /* D3D12 spec isn't clear on what is allowed to be updated and when */
++            vk_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_OPACITY_MICROMAP_UPDATE_BIT_KHR;
++        }
++        if (flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS)
++            vk_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_BIT_KHR;
++    }
++    else if (flags & (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_OMM_LINKAGE_UPDATE |
++            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS))
++    {
++        FIXME_ONCE("Opacity micromap build flags requested without opacity micromap support; ignoring.\n");
+     }
+-    if (flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS)
+-        vk_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_BIT_KHR;
+ 
+     return vk_flags;
+ }
+@@ -144,7 +155,7 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
+         RT_TRACE("Bottom level build.\n");
+     }
+ 
+-    build_info->flags = d3d12_build_flags_to_vk(desc->Flags);
++    build_info->flags = d3d12_build_flags_to_vk(device, desc->Flags);
+ 
+     if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE)
+     {
