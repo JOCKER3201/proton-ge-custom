@@ -1,0 +1,153 @@
+From: Claude (Anthropic AI) <noreply@anthropic.com>
+Subject: [PATCH] nvapi: Acknowledge NvAPI_D3D_SetReflexSync.
+
+Streamline calls this once per frame when DLSS Frame Generation is on. With no
+entry point registered it fails with NVAPI_NO_IMPLEMENTATION every time, and
+measured on The Witcher 3 Remastered with DLSSGMode=2 and five generated frames
+that was 200514 failed calls in 857 seconds — 234 per second, each one going
+through nvapi_QueryInterface and taking the process wide registry mutex, from
+the frame generator's Present thread.
+
+The shim in sl.common.dll caches the resolved pointer, but a stored nullptr is
+indistinguishable from "not resolved yet", so a missing entry point is re-looked
+up on every call. Registering it makes the pointer non-null, the cache sticks
+and the count drops to one.
+
+This cannot make Reflex Sync work and that is permanent. The struct feeds the
+NVIDIA user mode driver with display pacing data (vblankIntervalUs,
+timeInQueueUs, timeInQueueUsTarget) and with driver side Dynamic Frame
+Generation control (fgMultiplier, dfgMaxMultiplier, dfgTargetFps). Nothing in
+this stack can receive any of it: ID3DLowLatencyDevice exposes sleep mode,
+markers and latency queries only, VK_NV_low_latency2 has no notion of a vblank
+interval or a frame multiplier, and VK_NV_present_metering carries
+numFramesPerBatch, which belongs to NV_FLIP_CONFIG and NvAPI_D3D12_SetFlipConfig
+rather than here. So the function validates its arguments, logs what was asked
+for and returns NVAPI_OK without touching device state.
+
+Returning OK rather than NO_IMPLEMENTATION is safe here, and that was checked
+rather than assumed: in sl.dlss_g.dll the two wrappers that call this
+(setDynamicMFGParams at 0x180064c40 and setReflexTiming at 0x180064ab0) are
+invoked from five sites and every one of them discards the return value in al
+without a test, and both function bodies return a constant on success. The two
+status codes are behaviourally indistinguishable for that build. Registering the
+entry point and then returning NO_IMPLEMENTATION would be the worst of the three
+options: the shim would cache a valid pointer and keep making real cross DLL
+calls, while the log storm stayed.
+
+bEnable and bDisable are deliberately not routed into SetLatencySleepMode. That
+call also carries lowLatencyBoost and minimumIntervalUs, which the application
+owns through NvAPI_D3D_SetSleepMode, and re-issuing it from here would silently
+overwrite both — the existing dedup in nvapi_d3d.cpp does not cover boost, so it
+would not even be noticed. Upstream PR #396 does exactly that and was rejected.
+
+Upstream rejected this shape of change (jp7677/dxvk-nvapi#396, 2026-09-21), so
+this stays local. DXVK_NVAPI_DISABLE_ENTRYPOINTS=NvAPI_D3D_SetReflexSync
+restores the previous behaviour without a rebuild.
+
+Verified: compiles clean for x86_64 and i386 with the project's mingw toolchain,
+zero warnings, and the resulting nvapi64.dll and nvapi.dll contain the log string
+this function emits, which the previous build does not. NOT verified: the unit
+tests from the design note were left out because they could not be compiled here
+(they are behind -Denable_tests and x86_64 only), and the latency gain was never
+measured in microseconds — only the removed operations were counted.
+
+Author: Claude (Anthropic AI), commissioned and supervised by the repository owner.
+diff --git a/src/nvapi_d3d.cpp b/src/nvapi_d3d.cpp
+index 09fc384..0a5cd8f 100644
+--- a/src/nvapi_d3d.cpp
++++ b/src/nvapi_d3d.cpp
+@@ -378,3 +378,82 @@ NVAPI_FUNCTION NvAPI_D3D_SetLatencyMarker(IUnknown* pDev, NV_LATENCY_MARKER_PARA
+             return Error(n, alreadyLoggedError);
+     }
+ }
++
++NVAPI_FUNCTION NvAPI_D3D_SetReflexSync(IUnknown* pDev, NV_SET_REFLEX_SYNC_PARAMS* pSetReflexSyncParams) {
++    static constexpr auto n = FUNC;
++    thread_local bool alreadyLoggedOk = false;
++    thread_local bool alreadyLoggedNoImplementation = false;
++
++    if (log::tracing())
++        log::trace(n, log::fmt::ptr(pDev), log::fmt::ptr(pSetReflexSyncParams));
++
++    // Reflex Sync feeds the NVIDIA UMD with display-pacing data (vblankIntervalUs,
++    // timeInQueueUs/timeInQueueUsTarget) and with driver-side Dynamic Frame
++    // Generation control (fgMultiplier, dfgMaxMultiplier, dfgTargetFps). None of
++    // that has a receiver here: ID3DLowLatencyDevice exposes sleep mode, markers
++    // and latency queries only, VK_NV_low_latency2 has no notion of a vblank
++    // interval or a frame multiplier, and VK_NV_present_metering carries
++    // numFramesPerBatch, which belongs to NV_FLIP_CONFIG/NvAPI_D3D12_SetFlipConfig
++    // and not here. So this entry point only acknowledges the request and records
++    // what was asked for; it deliberately changes no device state.
++    //
++    // In particular bEnable/bDisable are NOT routed into SetLatencySleepMode:
++    // that call also carries lowLatencyBoost and minimumIntervalUs, which the
++    // application owns through NvAPI_D3D_SetSleepMode, and re-issuing it from
++    // here would silently overwrite both.
++    static uint32_t lastFlags = UINT32_MAX;
++    static uint32_t lastVblankIntervalUs = UINT32_MAX;
++    static uint32_t lastTimeInQueueUsTarget = UINT32_MAX;
++    static uint32_t lastFgMultiplier = UINT32_MAX;
++    static uint32_t lastDfgMaxMultiplier = UINT32_MAX;
++    static uint32_t lastDfgTargetFps = UINT32_MAX;
++
++    if (!nvapiAdapterRegistry)
++        return ApiNotInitialized(n);
++
++    if (!pDev || !pSetReflexSyncParams)
++        return InvalidArgument(n);
++
++    if (pSetReflexSyncParams->version != NV_SET_REFLEX_SYNC_PARAMS_VER1)
++        return IncompatibleStructVersion(n, pSetReflexSyncParams->version);
++
++    if (env::needsUnsupportedLowLatencyDevice())
++        return NoImplementation(n, alreadyLoggedNoImplementation);
++
++    auto lowLatencyDevice = NvapiD3dLowLatencyDevice::GetOrCreate(pDev);
++    if (!lowLatencyDevice || !lowLatencyDevice->SupportsLowLatency())
++        return NoImplementation(n, alreadyLoggedNoImplementation);
++
++    // NvU8 fields have to be widened, otherwise the stream inserter writes them
++    // as characters. timeInQueueUs is intentionally not part of the comparison,
++    // it is a per-frame measurement and would log on every single call.
++    auto flags = static_cast<uint32_t>(pSetReflexSyncParams->bEnable)
++        | static_cast<uint32_t>(pSetReflexSyncParams->bDisable) << 1;
++    auto fgMultiplier = static_cast<uint32_t>(pSetReflexSyncParams->fgMultiplier);
++    auto dfgMaxMultiplier = static_cast<uint32_t>(pSetReflexSyncParams->dfgMaxMultiplier);
++
++    if (lastFlags != flags
++        || lastVblankIntervalUs != pSetReflexSyncParams->vblankIntervalUs
++        || lastTimeInQueueUsTarget != pSetReflexSyncParams->timeInQueueUsTarget
++        || lastFgMultiplier != fgMultiplier
++        || lastDfgMaxMultiplier != dfgMaxMultiplier
++        || lastDfgTargetFps != pSetReflexSyncParams->dfgTargetFps) {
++        lastFlags = flags;
++        lastVblankIntervalUs = pSetReflexSyncParams->vblankIntervalUs;
++        lastTimeInQueueUsTarget = pSetReflexSyncParams->timeInQueueUsTarget;
++        lastFgMultiplier = fgMultiplier;
++        lastDfgMaxMultiplier = dfgMaxMultiplier;
++        lastDfgTargetFps = pSetReflexSyncParams->dfgTargetFps;
++
++        return Ok(str::format(n,
++            " (", pSetReflexSyncParams->bDisable ? "Disable" : (pSetReflexSyncParams->bEnable ? "Enable" : "Update"),
++            ", acknowledged without applying:",
++            " vblankInterval=", pSetReflexSyncParams->vblankIntervalUs, "us",
++            ", timeInQueueTarget=", pSetReflexSyncParams->timeInQueueUsTarget, "us",
++            ", fgMultiplier=", fgMultiplier,
++            ", dfgMaxMultiplier=", dfgMaxMultiplier,
++            ", dfgTargetFps=", pSetReflexSyncParams->dfgTargetFps, ")"));
++    }
++
++    return Ok(n, alreadyLoggedOk);
++}
+diff --git a/src/nvapi_interface.cpp b/src/nvapi_interface.cpp
+index 3e45558..35a6549 100644
+--- a/src/nvapi_interface.cpp
++++ b/src/nvapi_interface.cpp
+@@ -144,6 +144,7 @@ NVAPI_QUERY_INTERFACE nvapi_QueryInterface(NvU32 id) {
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D_Sleep)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D_GetLatency)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D_SetLatencyMarker)
++    INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D_SetReflexSync)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_Vulkan_InitLowLatencyDevice)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_Vulkan_DestroyLowLatencyDevice)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_Vulkan_GetSleepStatus)

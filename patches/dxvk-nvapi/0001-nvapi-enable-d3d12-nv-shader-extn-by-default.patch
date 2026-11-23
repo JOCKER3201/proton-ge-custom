@@ -1,0 +1,25 @@
+From: Claude (Anthropic AI) <noreply@anthropic.com>
+Subject: [PATCH] nvapi: Enable D3D12 NV shader extensions by default.
+
+The opt-in existed because vkd3d-proton dropped the NVAPI FP16/FP32 atomic
+intrinsics, which broke titles that use them without querying support first
+(Cyberpunk 2077). Those intrinsics are now translated, so flip the default.
+DXVK_NVAPI_D3D12_NV_SHADER_EXTN=0 still forces it off.
+---
+--- a/src/util/util_env.cpp
++++ b/src/util/util_env.cpp
+@@ -196,8 +196,12 @@
+     bool isD3d12NvShaderExtnEnabled() {
+         static bool alreadyLogged = false;
+ 
+-        static bool enabled = getEnvVariable("DXVK_NVAPI_D3D12_NV_SHADER_EXTN") == "1"
+-            || isNvidiaRtxPathTracingSample();
++        // Enabled by default: the vkd3d-proton side now implements the FP16x2
++        // and FP32 atomic intrinsics that used to be silently dropped, which was
++        // the reason this was kept behind an opt-in. Set the variable to 0 to
++        // force it off again.
++        auto override = getEnvVariable("DXVK_NVAPI_D3D12_NV_SHADER_EXTN");
++        static bool enabled = override != "0";
+ 
+         if (enabled) {
+             if (!std::exchange(alreadyLogged, true))

@@ -64,6 +64,8 @@ apply_all_in_dir() {
     pushd dxvk-nvapi
     git reset --hard HEAD
     git clean -xdf
+    echo "DXVK-NVAPI: enable D3D12 NV shader extensions by default"
+    apply_all_in_dir "../patches/dxvk-nvapi/"
     popd
 
     pushd wineopenxr
