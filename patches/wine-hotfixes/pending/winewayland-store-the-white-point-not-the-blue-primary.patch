@@ -1,0 +1,57 @@
+From: Claude (Anthropic AI) <noreply@anthropic.com>
+Date: Sat, 6 Sep 2026 10:00:00 +0000
+Subject: [PATCH] winewayland: Store the white point, not the blue primary.
+
+wayland_color_manager_primaries() accepts w_x and w_y, prints them in its
+TRACE, and then stores b_x and b_y into primaries->w_x/w_y. The white point
+of every output therefore equals its blue primary.
+
+Consequences, in order:
+
+  - WAYLAND_OUTPUT_PRIMARIES is set, so display.c reports srgb = FALSE and
+    win32u/sysparams.c takes the "real chromaticity" branch when it builds the
+    synthetic EDID, writing the bad white point into bytes 0x19..0x22.
+  - DXVK reads that EDID back through libdisplay-info and publishes it as
+    DXGI_OUTPUT_DESC1.WhitePoint; dxvk-nvapi publishes the same values as
+    NV_HDR_CAPABILITIES.display_data.displayWhitePoint_x/y. The zero-coordinate
+    D65 fallback in wsi_edid.h does not trigger, because the coordinates are
+    non-zero, merely wrong.
+  - An RGB->XYZ matrix derived from these primaries is singular: with the white
+    point sitting on the blue primary, det() is exactly zero. Colours pushed
+    through a chromatic adaptation built from it come out with the blue channel
+    gained roughly fifty times relative to red and green.
+
+Observed as Cyberpunk 2077 rendering its (yellow) epilepsy warning in violet
+whenever HDR is enabled, from the first frame and on flat 2D content. Only HDR
+is affected because the SDR path never consumes DESC1/NVAPI colorimetry.
+
+Verified on this machine by decoding the synthetic EDID out of the game's
+prefix registry: both attached outputs had W == B, (0.1436, 0.0557) and
+(0.1465, 0.0645), where D65 is (0.3127, 0.3290).
+
+Note that the TRACE prints the event arguments rather than the stored struct,
+so the log looks entirely healthy while the wrong values are in memory. This is
+why it survived so long.
+
+Introduced by wine-hotfixes/wine-wayland/0242-winewayland-Remove-output_info-
+structure.patch, which hand-expanded the COPY(w_x)/COPY(w_y) macro from patch
+0096 and got the arguments wrong. Not an upstream Wine bug.
+
+Authored by Claude (Anthropic AI) at the request of the repository owner.
+---
+ dlls/winewayland.drv/wayland_output.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -410,8 +410,8 @@
+     primaries->g_y = round((g_y * 1e-6) * 1024);
+     primaries->b_x = round((b_x * 1e-6) * 1024);
+     primaries->b_y = round((b_y * 1e-6) * 1024);
+-    primaries->w_x = round((b_x * 1e-6) * 1024);
+-    primaries->w_y = round((b_y * 1e-6) * 1024);
++    primaries->w_x = round((w_x * 1e-6) * 1024);
++    primaries->w_y = round((w_y * 1e-6) * 1024);
+ 
+     TRACE("primaries: {%lf, %lf, %lf, %lf, %lf, %lf, %lf, %lf}\n",
+             r_x * 1e-6, r_y * 1e-6, g_x * 1e-6, g_y * 1e-6,
