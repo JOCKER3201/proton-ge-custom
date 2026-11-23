@@ -1,0 +1,165 @@
+From: Krzysztof Bogacki <krzysztof.bogacki@leancode.pl>
+Subject: [PATCH] vkd3d: Support NVAPI triangle object positions (upstream PR #3507)
+
+Squashed port of https://github.com/HansKristian-Work/vkd3d-proton/pull/3507
+at af3c9329. The PR is based on cae8353e, which is exactly the vkd3d-proton
+pin of GE-Proton11-14, so the diff is taken unchanged:
+  6368e0e4 vkd3d: Enable VK_KHR_ray_tracing_position_fetch.
+  b464114b vkd3d: Handle ALLOW_DATA_ACCESS RTAS build flag.
+  107def4f vkd3d: Report triangle object positions NV shader intrinsic support.
+  af3c9329 vkd3d: Reorder NV shader opcodes in the switch block.
+
+The other two halves of the feature are already in the GE-Proton11-14 pins:
+dxil-spirv emits SPV_KHR_ray_tracing_position_fetch for the NV_EXTN_OP_RT_*
+TRIANGLE_OBJECT_POSITIONS intrinsics, and dxvk-nvapi maps the NVAPI
+ALLOW_DATA_ACCESS build flag and forwards IsNvShaderExtnOpCodeSupported.
+This patch adds the missing vkd3d-proton part: it enables
+VK_KHR_ray_tracing_position_fetch, translates the ALLOW_DATA_ACCESS build flag
+and reports the three intrinsics as supported when the driver has the feature.
+
+Still under review upstream: the maintainer asked for an SM 6.10 note and a
+suffix on the ALLOW_DATA_ACCESS enum name. The flag value (0x100) is not
+expected to change. Drop this patch once the PR is merged into the pin.
+---
+ include/vkd3d_d3d12.idl             |  1 +
+ libs/vkd3d/acceleration_structure.c |  2 ++
+ libs/vkd3d/device.c                 |  7 +++++++
+ libs/vkd3d/device_vkd3d_ext.c       | 47 ++++++++++++++++++++++++++---------------------
+ libs/vkd3d/vkd3d_private.h          |  2 ++
+ 5 files changed, 38 insertions(+), 21 deletions(-)
+
+diff --git a/include/vkd3d_d3d12.idl b/include/vkd3d_d3d12.idl
+index 514726fc..8f78338b 100644
+--- a/include/vkd3d_d3d12.idl
++++ b/include/vkd3d_d3d12.idl
+@@ -3962,6 +3962,7 @@ typedef enum D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS
+     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE = 0x20,
+     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_OMM_LINKAGE_UPDATE = 0x40,
+     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS = 0x80,
++    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DATA_ACCESS = 0x100,
+ } D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS;
+ cpp_quote("DEFINE_ENUM_FLAG_OPERATORS(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS);")
+ 
+diff --git a/libs/vkd3d/acceleration_structure.c b/libs/vkd3d/acceleration_structure.c
+index 7f7ed1a5..ec93916c 100644
+--- a/libs/vkd3d/acceleration_structure.c
++++ b/libs/vkd3d/acceleration_structure.c
+@@ -44,6 +44,8 @@ static VkBuildAccelerationStructureFlagsKHR d3d12_build_flags_to_vk(
+     }
+     if (flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS)
+         vk_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_BIT_KHR;
++    if (flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DATA_ACCESS)
++        vk_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR;
+ 
+     return vk_flags;
+ }
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 3139d6dd..790e5b48 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -73,6 +73,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+     VK_EXTENSION_DISABLE_COND(KHR_DEFERRED_HOST_OPERATIONS, KHR_deferred_host_operations, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
+     VK_EXTENSION_DISABLE_COND(KHR_RAY_QUERY, KHR_ray_query, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
+     VK_EXTENSION_DISABLE_COND(KHR_RAY_TRACING_MAINTENANCE_1, KHR_ray_tracing_maintenance1, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
++    VK_EXTENSION_DISABLE_COND(KHR_RAY_TRACING_POSITION_FETCH, KHR_ray_tracing_position_fetch, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
+     VK_EXTENSION(KHR_FRAGMENT_SHADING_RATE, KHR_fragment_shading_rate),
+     VK_EXTENSION(KHR_FRAGMENT_SHADER_BARYCENTRIC, KHR_fragment_shader_barycentric),
+     VK_EXTENSION(KHR_PRESENT_MODE_FIFO_LATEST_READY, KHR_present_mode_fifo_latest_ready),
+@@ -1388,6 +1389,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+         vk_prepend_struct(&info->features2, &info->ray_tracing_maintenance1_features);
+     }
+ 
++    if (vulkan_info->KHR_ray_tracing_position_fetch)
++    {
++        info->ray_tracing_position_fetch_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
++        vk_prepend_struct(&info->features2, &info->ray_tracing_position_fetch_features);
++    }
++
+     if (vulkan_info->KHR_fragment_shading_rate)
+     {
+         info->fragment_shading_rate_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR;
+diff --git a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
+index 694c4e1e..18f89986 100644
+--- a/libs/vkd3d/device_vkd3d_ext.c
++++ b/libs/vkd3d/device_vkd3d_ext.c
+@@ -737,6 +737,32 @@ static BOOL STDMETHODCALLTYPE d3d12_device_vkd3d_ext_IsNvShaderExtnOpCodeSupport
+ 
+     switch (op_code)
+     {
++        case NV_EXTN_OP_HIT_OBJECT_TRACE_RAY:
++        case NV_EXTN_OP_HIT_OBJECT_MAKE_HIT:
++        case NV_EXTN_OP_HIT_OBJECT_MAKE_HIT_WITH_RECORD_INDEX:
++        case NV_EXTN_OP_HIT_OBJECT_MAKE_MISS:
++        case NV_EXTN_OP_HIT_OBJECT_REORDER_THREAD:
++        case NV_EXTN_OP_HIT_OBJECT_INVOKE:
++        case NV_EXTN_OP_HIT_OBJECT_IS_MISS:
++        case NV_EXTN_OP_HIT_OBJECT_GET_INSTANCE_ID:
++        case NV_EXTN_OP_HIT_OBJECT_GET_INSTANCE_INDEX:
++        case NV_EXTN_OP_HIT_OBJECT_GET_PRIMITIVE_INDEX:
++        case NV_EXTN_OP_HIT_OBJECT_GET_GEOMETRY_INDEX:
++        case NV_EXTN_OP_HIT_OBJECT_GET_HIT_KIND:
++        case NV_EXTN_OP_HIT_OBJECT_GET_RAY_DESC:
++        case NV_EXTN_OP_HIT_OBJECT_GET_ATTRIBUTES:
++        case NV_EXTN_OP_HIT_OBJECT_GET_SHADER_TABLE_INDEX:
++        case NV_EXTN_OP_HIT_OBJECT_LOAD_LOCAL_ROOT_TABLE_CONSTANT:
++        case NV_EXTN_OP_HIT_OBJECT_IS_HIT:
++        case NV_EXTN_OP_HIT_OBJECT_IS_NOP:
++        case NV_EXTN_OP_HIT_OBJECT_MAKE_NOP:
++            return ser_features->rayTracingInvocationReorder ? TRUE : FALSE;
++
++        case NV_EXTN_OP_RT_TRIANGLE_OBJECT_POSITIONS:
++        case NV_EXTN_OP_RT_CANDIDATE_TRIANGLE_OBJECT_POSITIONS:
++        case NV_EXTN_OP_RT_COMMITTED_TRIANGLE_OBJECT_POSITIONS:
++            return device->device_info.ray_tracing_position_fetch_features.rayTracingPositionFetch ? TRUE : FALSE;
++
+         case NV_EXTN_OP_RT_SPHERE_OBJECT_POSITION_AND_RADIUS:
+         case NV_EXTN_OP_RT_CANDIDATE_SPHERE_OBJECT_POSITION_AND_RADIUS:
+         case NV_EXTN_OP_RT_COMMITTED_SPHERE_OBJECT_POSITION_AND_RADIUS:
+@@ -767,27 +793,6 @@ static BOOL STDMETHODCALLTYPE d3d12_device_vkd3d_ext_IsNvShaderExtnOpCodeSupport
+         case NV_EXTN_OP_RT_COMMIT_NONOPAQUE_BUILTIN_PRIMITIVE_HIT:
+             return lss_features->spheres || lss_features->linearSweptSpheres ? TRUE : FALSE;
+ 
+-        case NV_EXTN_OP_HIT_OBJECT_TRACE_RAY:
+-        case NV_EXTN_OP_HIT_OBJECT_MAKE_HIT:
+-        case NV_EXTN_OP_HIT_OBJECT_MAKE_HIT_WITH_RECORD_INDEX:
+-        case NV_EXTN_OP_HIT_OBJECT_MAKE_MISS:
+-        case NV_EXTN_OP_HIT_OBJECT_REORDER_THREAD:
+-        case NV_EXTN_OP_HIT_OBJECT_INVOKE:
+-        case NV_EXTN_OP_HIT_OBJECT_IS_MISS:
+-        case NV_EXTN_OP_HIT_OBJECT_GET_INSTANCE_ID:
+-        case NV_EXTN_OP_HIT_OBJECT_GET_INSTANCE_INDEX:
+-        case NV_EXTN_OP_HIT_OBJECT_GET_PRIMITIVE_INDEX:
+-        case NV_EXTN_OP_HIT_OBJECT_GET_GEOMETRY_INDEX:
+-        case NV_EXTN_OP_HIT_OBJECT_GET_HIT_KIND:
+-        case NV_EXTN_OP_HIT_OBJECT_GET_RAY_DESC:
+-        case NV_EXTN_OP_HIT_OBJECT_GET_ATTRIBUTES:
+-        case NV_EXTN_OP_HIT_OBJECT_GET_SHADER_TABLE_INDEX:
+-        case NV_EXTN_OP_HIT_OBJECT_LOAD_LOCAL_ROOT_TABLE_CONSTANT:
+-        case NV_EXTN_OP_HIT_OBJECT_IS_HIT:
+-        case NV_EXTN_OP_HIT_OBJECT_IS_NOP:
+-        case NV_EXTN_OP_HIT_OBJECT_MAKE_NOP:
+-            return ser_features->rayTracingInvocationReorder ? TRUE : FALSE;
+-
+         default:
+             return FALSE;
+     }
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index e63dc7b7..9c30f5e1 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -134,6 +134,7 @@ struct vkd3d_vulkan_info
+     bool KHR_ray_query;
+     bool KHR_fragment_shading_rate;
+     bool KHR_ray_tracing_maintenance1;
++    bool KHR_ray_tracing_position_fetch;
+     bool KHR_fragment_shader_barycentric;
+     bool KHR_external_memory_win32;
+     bool KHR_external_semaphore_win32;
+@@ -5405,6 +5406,7 @@ struct vkd3d_physical_device_info
+     VkPhysicalDeviceImageViewMinLodFeaturesEXT image_view_min_lod_features;
+     VkPhysicalDeviceCoherentMemoryFeaturesAMD device_coherent_memory_features_amd;
+     VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR ray_tracing_maintenance1_features;
++    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR ray_tracing_position_fetch_features;
+     VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT device_generated_commands_features;
+     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shader_features;
+     VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT shader_module_identifier_features;
